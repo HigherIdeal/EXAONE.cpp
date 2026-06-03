@@ -167,17 +167,14 @@ class Attention(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.w1 = nn.Parameter(torch.empty(args.hidden_dim, args.dim))
-        self.w2 = nn.Parameter(torch.empty(args.dim, args.hidden_dim))
-        self.w3 = nn.Parameter(torch.empty(args.hidden_dim, args.dim))
+        self.wg = nn.Parameter(torch.empty(args.hidden_dim, args.dim))
+        self.wd = nn.Parameter(torch.empty(args.dim, args.hidden_dim))
+        self.wu = nn.Parameter(torch.empty(args.hidden_dim, args.dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        f1 = linear(x, self.w1)
-        silu = F.silu(f1)
-        f3 = linear(x, self.w3)
-        mul = silu * f3
-        f2 = linear(mul, self.w2)
-        return f2
+        gate = linear(x, self.wg)
+        up = linear(x, self.wu)
+        return linear(F.silu(gate) * up, self.wd)
 
 
 class TransformerBlock(nn.Module):

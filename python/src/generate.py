@@ -19,7 +19,10 @@ except ImportError:
     from model import ModelArgs, Transformer
 
 
-MODEL_ID = "LGAI-EXAONE/EXAONE-4.0-1.2B"
+HF_MODEL_ID = "LGAI-EXAONE/EXAONE-4.0-1.2B"
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+MODEL_ID = os.path.join(REPO_ROOT, "weight", "exaone4-1.2b")
+MODEL_PTH = "model.pth"
 
 
 @contextmanager
@@ -94,13 +97,25 @@ def convert_hf_state_dict(state_dict: dict[str, torch.Tensor], n_layers: int) ->
         checkpoint[f"{dst}.attention.wo"] = state_dict[f"{hf}.self_attn.o_proj.weight"]
         checkpoint[f"{dst}.attention.q_norm.weight"] = state_dict[f"{hf}.self_attn.q_norm.weight"]
         checkpoint[f"{dst}.attention.k_norm.weight"] = state_dict[f"{hf}.self_attn.k_norm.weight"]
-        checkpoint[f"{dst}.feed_forward.w1"] = state_dict[f"{hf}.mlp.gate_proj.weight"]
-        checkpoint[f"{dst}.feed_forward.w2"] = state_dict[f"{hf}.mlp.down_proj.weight"]
-        checkpoint[f"{dst}.feed_forward.w3"] = state_dict[f"{hf}.mlp.up_proj.weight"]
+        checkpoint[f"{dst}.feed_forward.wg"] = state_dict[f"{hf}.mlp.gate_proj.weight"]
+        checkpoint[f"{dst}.feed_forward.wd"] = state_dict[f"{hf}.mlp.down_proj.weight"]
+        checkpoint[f"{dst}.feed_forward.wu"] = state_dict[f"{hf}.mlp.up_proj.weight"]
         checkpoint[f"{dst}.attention_norm.weight"] = state_dict[f"{hf}.post_attention_layernorm.weight"]
         checkpoint[f"{dst}.ffn_norm.weight"] = state_dict[f"{hf}.post_feedforward_layernorm.weight"]
 
     return checkpoint
+
+
+def is_converted_model_dir(model_id: str) -> bool:
+    return os.path.isdir(model_id) and os.path.exists(os.path.join(model_id, MODEL_PTH))
+
+
+def resolve_runtime_model_id(model_id: str) -> str:
+    if is_converted_model_dir(model_id):
+        return model_id
+    if os.path.abspath(model_id) == os.path.abspath(MODEL_ID):
+        return HF_MODEL_ID
+    return model_id
 
 
 def resolve_model_file(model_id: str, filename: str) -> str:
@@ -137,6 +152,20 @@ def load_hf_state_dict(model_id: str) -> dict[str, torch.Tensor]:
     return state_dict
 
 
+def load_converted_state_dict(model_id: str) -> dict[str, torch.Tensor]:
+    checkpoint_path = os.path.join(model_id, MODEL_PTH)
+    try:
+        return torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    except TypeError:
+        return torch.load(checkpoint_path, map_location="cpu")
+
+
+def load_model_state_dict(model_id: str, n_layers: int) -> dict[str, torch.Tensor]:
+    if is_converted_model_dir(model_id):
+        return load_converted_state_dict(model_id)
+    return convert_hf_state_dict(load_hf_state_dict(model_id), n_layers)
+
+
 class Llama:
     @staticmethod
     def build(
@@ -149,6 +178,7 @@ class Llama:
         start_time = time.time()
         device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         dtype = dtype or (torch.bfloat16 if device.type == "cuda" else torch.float32)
+        model_id = resolve_runtime_model_id(model_id)
 
         with force_utf8_locale(), force_utf8_chat_template_open():
             tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
@@ -171,7 +201,7 @@ class Llama:
         )
 
         model = Transformer(model_args).to(device=device, dtype=dtype)
-        checkpoint = convert_hf_state_dict(load_hf_state_dict(model_id), model_args.n_layers)
+        checkpoint = load_model_state_dict(model_id, model_args.n_layers)
         missing, unexpected = model.load_state_dict(checkpoint, strict=False)
         if missing or unexpected:
             raise RuntimeError(f"checkpoint mismatch: missing={missing}, unexpected={unexpected}")

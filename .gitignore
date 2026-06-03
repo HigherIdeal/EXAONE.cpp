@@ -1,2 +1,5 @@
 ﻿__pycache__/
 *.pyc
+plan/
+exaone4-1.2b/
+quant_cache/
