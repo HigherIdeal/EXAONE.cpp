@@ -1,3 +1,6 @@
 torch
 transformers
 accelerate
+safetensors
+datasets
+tqdm

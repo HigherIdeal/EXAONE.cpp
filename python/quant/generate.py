@@ -1,17 +1,9 @@
 import time
-import builtins
-import io
-import json
-import locale
-import os
-from contextlib import contextmanager
 from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from safetensors.torch import load_file as load_safetensors_file
-from transformers import AutoTokenizer
-from transformers.utils.hub import cached_file
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 try:
     from .model import ModelArgs, Transformer
@@ -20,63 +12,6 @@ except ImportError:
 
 
 MODEL_ID = "LGAI-EXAONE/EXAONE-4.0-1.2B"
-
-
-@contextmanager
-def force_utf8_locale():
-    # Transformers may read tokenizer sidecar files with the process default
-    # text encoding. Force UTF-8 briefly so the same code path works on
-    # Windows cp949 and on UTF-8-first Linux environments.
-    original_getpreferredencoding = locale.getpreferredencoding
-    original_getencoding = getattr(locale, "getencoding", None)
-
-    locale.getpreferredencoding = lambda do_setlocale=True: "utf-8"
-    if original_getencoding is not None:
-        locale.getencoding = lambda: "utf-8"
-    try:
-        yield
-    finally:
-        locale.getpreferredencoding = original_getpreferredencoding
-        if original_getencoding is not None:
-            locale.getencoding = original_getencoding
-
-
-@contextmanager
-def force_utf8_chat_template_open():
-    # Some tokenizer repos ship `chat_template.jinja` as UTF-8 text.
-    # On Windows, Transformers may open it with the process default encoding
-    # (for example cp949), which raises a decode error. Intercept only plain
-    # text reads for that filename and leave every other file operation alone.
-    original_open = builtins.open
-    original_io_open = io.open
-
-    def utf8_open(file, mode="r", buffering=-1, encoding=None, errors=None, newline=None, closefd=True, opener=None):
-        path = os.fspath(file) if isinstance(file, (str, os.PathLike)) else None
-        if (
-            path is not None
-            and "b" not in mode
-            and encoding is None
-            and os.path.basename(path) == "chat_template.jinja"
-        ):
-            encoding = "utf-8"
-        return original_open(
-            file,
-            mode,
-            buffering=buffering,
-            encoding=encoding,
-            errors=errors,
-            newline=newline,
-            closefd=closefd,
-            opener=opener,
-        )
-
-    builtins.open = utf8_open
-    io.open = utf8_open
-    try:
-        yield
-    finally:
-        builtins.open = original_open
-        io.open = original_io_open
 
 
 def convert_hf_state_dict(state_dict: dict[str, torch.Tensor], n_layers: int) -> dict[str, torch.Tensor]:
@@ -103,40 +38,6 @@ def convert_hf_state_dict(state_dict: dict[str, torch.Tensor], n_layers: int) ->
     return checkpoint
 
 
-def resolve_model_file(model_id: str, filename: str) -> str:
-    candidate = os.path.join(model_id, filename)
-    if os.path.exists(candidate):
-        return candidate
-    return cached_file(model_id, filename)
-
-
-def load_model_config(model_id: str) -> dict:
-    config_path = resolve_model_file(model_id, "config.json")
-    with open(config_path, encoding="utf-8") as handle:
-        return json.load(handle)
-
-
-def load_hf_state_dict(model_id: str) -> dict[str, torch.Tensor]:
-    index_filename = "model.safetensors.index.json"
-    try:
-        index_path = resolve_model_file(model_id, index_filename)
-    except Exception:
-        index_path = None
-
-    if index_path is None:
-        weights_path = resolve_model_file(model_id, "model.safetensors")
-        return load_safetensors_file(weights_path)
-
-    with open(index_path, encoding="utf-8") as handle:
-        weight_map = json.load(handle)["weight_map"]
-
-    state_dict: dict[str, torch.Tensor] = {}
-    for shard_name in sorted(set(weight_map.values())):
-        shard_path = resolve_model_file(model_id, shard_name)
-        state_dict.update(load_safetensors_file(shard_path))
-    return state_dict
-
-
 class Llama:
     @staticmethod
     def build(
@@ -150,32 +51,38 @@ class Llama:
         device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         dtype = dtype or (torch.bfloat16 if device.type == "cuda" else torch.float32)
 
-        with force_utf8_locale(), force_utf8_chat_template_open():
-            tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-        config = load_model_config(model_id)
+        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            dtype=dtype,
+            trust_remote_code=True,
+            attn_implementation="eager",
+        )
+        config = hf_model.config
         model_args = ModelArgs(
-            dim=config["hidden_size"],
-            n_layers=config["num_hidden_layers"],
-            n_heads=config["num_attention_heads"],
-            n_kv_heads=config["num_key_value_heads"],
-            vocab_size=config["vocab_size"],
-            hidden_dim=config["intermediate_size"],
-            norm_eps=config["rms_norm_eps"],
+            dim=config.hidden_size,
+            n_layers=config.num_hidden_layers,
+            n_heads=config.num_attention_heads,
+            n_kv_heads=config.num_key_value_heads,
+            vocab_size=config.vocab_size,
+            hidden_dim=config.intermediate_size,
+            norm_eps=config.rms_norm_eps,
             max_batch_size=max_batch_size,
             max_seq_len=max_seq_len,
-            rope_theta=config["rope_theta"],
-            rope_factor=config["rope_scaling"]["factor"],
-            rope_low_freq_factor=config["rope_scaling"]["low_freq_factor"],
-            rope_high_freq_factor=config["rope_scaling"]["high_freq_factor"],
-            rope_original_max_position_embeddings=config["rope_scaling"]["original_max_position_embeddings"],
+            rope_theta=config.rope_parameters["rope_theta"],
+            rope_factor=config.rope_parameters["factor"],
+            rope_low_freq_factor=config.rope_parameters["low_freq_factor"],
+            rope_high_freq_factor=config.rope_parameters["high_freq_factor"],
+            rope_original_max_position_embeddings=config.rope_parameters["original_max_position_embeddings"],
         )
 
         model = Transformer(model_args).to(device=device, dtype=dtype)
-        checkpoint = convert_hf_state_dict(load_hf_state_dict(model_id), model_args.n_layers)
+        checkpoint = convert_hf_state_dict(hf_model.state_dict(), model_args.n_layers)
         missing, unexpected = model.load_state_dict(checkpoint, strict=False)
         if missing or unexpected:
             raise RuntimeError(f"checkpoint mismatch: missing={missing}, unexpected={unexpected}")
         model.eval()
+        del hf_model
         print(f"Loaded in {time.time() - start_time:.2f} seconds")
         return Llama(model, tokenizer)
 
