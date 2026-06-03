@@ -111,6 +111,9 @@ def main() -> None:
     parser.add_argument("--quant", action="store_true", help="Use the quantized model path under python/quant.")
     parser.add_argument("--partial_quant", "--partial-quant", action="store_true", help="Quantize only transformer layer 0.")
     parser.add_argument("--quant-block-size", type=int, default=128)
+    parser.add_argument("--target-module", default=None, help="Quantize one exact module, e.g. layers.0.attention.wq.")
+    parser.add_argument("--target-projections", default=None, help="Comma-separated projection names, e.g. wq,wk,wv,wo.")
+    parser.add_argument("--exclude-projections", default=None, help="Comma-separated projection names to skip, e.g. wd.")
     parser.add_argument("--calib-seq-len", type=int, default=2048)
     parser.add_argument("--calib-samples", type=int, default=8)
     parser.add_argument("--calib-seed", type=int, default=99)
@@ -121,11 +124,11 @@ def main() -> None:
         default=torch.float16,
         choices=tuple(DTYPE_MAP.values()),
         metavar="{" + ",".join(DTYPE_MAP) + "}",
-        help="Torch dtype to use when loading and running the model. Default: bfloat16",
+        help="Torch dtype to use when loading and running the model. Default: float16",
     )
     args = parser.parse_args()
 
-    if args.partial_quant:
+    if args.partial_quant or args.target_module or args.target_projections or args.exclude_projections:
         args.quant = True
 
     if args.quant:
@@ -142,6 +145,9 @@ def main() -> None:
     if args.quant:
         build_kwargs["quant_block_size"] = args.quant_block_size
         build_kwargs["partial_quant"] = args.partial_quant
+        build_kwargs["target_module"] = args.target_module
+        build_kwargs["target_projections"] = args.target_projections
+        build_kwargs["exclude_projections"] = args.exclude_projections
         build_kwargs["calib_seq_len"] = args.calib_seq_len
         build_kwargs["calib_samples"] = args.calib_samples
         build_kwargs["calib_seed"] = args.calib_seed

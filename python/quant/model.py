@@ -5,7 +5,9 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 from torch import nn
-from tqdm import tqdm
+
+import sys
+torch.set_printoptions(precision=8)
 
 @dataclass
 class ModelArgs:
@@ -37,321 +39,8 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self._norm(x.float()).type_as(x) * self.weight
 
-
-def sign_no_zero(x: torch.Tensor) -> torch.Tensor:
-    return torch.where(x >= 0, torch.ones_like(x), -torch.ones_like(x))
-
-
-def sign_ste(x: torch.Tensor) -> torch.Tensor:
-    hard = sign_no_zero(x)
-    return x + (hard - x).detach()
-
-
-def robust_diag(x: torch.Tensor, tau: float = 0.2, gamma: float = 0.2) -> torch.Tensor:
-    diag = x.float().pow(2).mean(dim=0).clamp_min(1e-8)
-    if diag.numel() > 1 and tau > 0:
-        threshold = torch.quantile(diag, min(1.0, 1.0 - tau))
-        diag = torch.minimum(diag, threshold)
-    return ((1.0 - gamma) * diag + gamma * diag.mean()).sqrt().clamp_min(1e-6)
-
-
-def nanoquant_rank(out_features: int, in_features: int, target_bits: float = 1.0) -> int:
-    rank = round(target_bits * out_features * in_features / (out_features + in_features))
-    return max(1, min(rank, out_features, in_features))
-
-
-def low_rank_binary_admm(
-    weight: torch.Tensor,
-    rank: int,
-    iters: int = 6,
-    rho: float = 1.0,
-    lamb: float = 1e-4,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    u, s, vh = torch.linalg.svd(weight.float(), full_matrices=False)
-    rank = min(rank, s.numel())
-    root_s = s[:rank].sqrt()
-    u_lat = u[:, :rank] * root_s
-    v_lat = vh[:rank, :].t() * root_s
-    u_bin = sign_no_zero(u_lat)
-    v_bin = sign_no_zero(v_lat)
-    u_dual = torch.zeros_like(u_lat)
-    v_dual = torch.zeros_like(v_lat)
-    eye = torch.eye(rank, device=weight.device, dtype=torch.float32)
-
-    for _ in range(iters):
-        lhs = v_lat.t() @ v_lat + (rho + lamb) * eye
-        rhs = weight.float() @ v_lat + rho * (u_bin - u_dual)
-        u_lat = torch.linalg.solve(lhs, rhs.t()).t()
-        u_bin = sign_no_zero(u_lat + u_dual)
-        u_dual = u_dual + u_lat - u_bin
-
-        lhs = u_lat.t() @ u_lat + (rho + lamb) * eye
-        rhs = weight.float().t() @ u_lat + rho * (v_bin - v_dual)
-        v_lat = torch.linalg.solve(lhs, rhs.t()).t()
-        v_bin = sign_no_zero(v_lat + v_dual)
-        v_dual = v_dual + v_lat - v_bin
-
-    return u_lat, v_lat
-
-
-def balance_latent_factors(u_lat: torch.Tensor, v_lat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    factor = (v_lat.norm().clamp_min(1e-8) / u_lat.norm().clamp_min(1e-8)).sqrt()
-    u_bal = u_lat * factor
-    v_bal = v_lat / factor
-    s_out = u_bal.abs().mean(dim=1).clamp_min(1e-6)
-    s_in = v_bal.abs().mean(dim=1).clamp_min(1e-6)
-    return sign_no_zero(u_bal / s_out[:, None]), sign_no_zero(v_bal / s_in[:, None]), s_out, s_in
-
-
-def nanoquant_weight(
-    u: torch.Tensor,
-    v: torch.Tensor,
-    out_scale: torch.Tensor,
-    in_scale: torch.Tensor,
-    ste: bool = False,
-) -> torch.Tensor:
-    u_bin = sign_ste(u) if ste else sign_no_zero(u)
-    v_bin = sign_ste(v) if ste else sign_no_zero(v)
-    return out_scale[:, None] * (u_bin @ v_bin.t()) * in_scale[None, :]
-
-
-def tune_latent_ste(
-    x: torch.Tensor,
-    y: torch.Tensor,
-    u_lat: torch.Tensor,
-    v_lat: torch.Tensor,
-    out_scale: torch.Tensor,
-    in_scale: torch.Tensor,
-    steps: int = 8,
-    lr: float = 5e-4,
-    progress_desc: Optional[str] = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if steps <= 0:
-        return u_lat, v_lat, out_scale, in_scale
-
-    u_param = nn.Parameter(u_lat.float())
-    v_param = nn.Parameter(v_lat.float())
-    out_scale_param = nn.Parameter(out_scale.float())
-    in_scale_param = nn.Parameter(in_scale.float())
-    optimizer = torch.optim.AdamW(
-        [u_param, v_param, out_scale_param, in_scale_param],
-        lr=lr,
-        weight_decay=0.0,
-    )
-    target_norm = y.pow(2).mean().clamp_min(1e-8)
-    iterator = range(steps)
-    if progress_desc is not None:
-        iterator = tqdm(iterator, desc=progress_desc, leave=False)
-
-    for _ in iterator:
-        optimizer.zero_grad(set_to_none=True)
-        weight_hat = nanoquant_weight(u_param, v_param, out_scale_param, in_scale_param, ste=True)
-        pred = x @ weight_hat.t()
-        loss = (pred - y).pow(2).mean() / target_norm
-        loss.backward()
-        optimizer.step()
-        if progress_desc is not None:
-            iterator.set_postfix_str(f"loss={float(loss.detach().cpu()):.4f}")
-
-    return (
-        u_param.detach(),
-        v_param.detach(),
-        out_scale_param.detach(),
-        in_scale_param.detach(),
-    )
-
-
-class NanoQuantLinearWeight(nn.Module):
-    def __init__(
-        self,
-        u_sign: torch.Tensor,
-        v_sign: torch.Tensor,
-        out_scale: torch.Tensor,
-        in_scale: torch.Tensor,
-        out_features: int,
-        in_features: int,
-    ):
-        super().__init__()
-        self.out_features = out_features
-        self.in_features = in_features
-        self.rank = u_sign.shape[1]
-        self.register_buffer("u_sign", u_sign.to(torch.int8), persistent=True)
-        self.register_buffer("v_sign", v_sign.to(torch.int8), persistent=True)
-        self.register_buffer("out_scale", out_scale.to(torch.float16), persistent=True)
-        self.register_buffer("in_scale", in_scale.to(torch.float16), persistent=True)
-        self._dequantized_cache: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
-
-    @classmethod
-    def from_float(
-        cls,
-        weight: torch.Tensor,
-        activation: dict[str, torch.Tensor],
-        target_bits: float = 1.0,
-        rank: Optional[int] = None,
-        admm_iters: int = 6,
-        rho: float = 1.0,
-        lamb: float = 1e-4,
-        tau: float = 0.2,
-        gamma: float = 0.2,
-        ste_steps: int = 8,
-        ste_lr: float = 5e-4,
-        progress_desc: Optional[str] = None,
-    ) -> "NanoQuantLinearWeight":
-        with torch.no_grad():
-            x = activation["x"].to(device=weight.device, dtype=torch.float32)
-            y = activation["y"].to(device=weight.device, dtype=torch.float32)
-            out_features, in_features = weight.shape
-            rank = rank or nanoquant_rank(out_features, in_features, target_bits=target_bits)
-
-            d_in = robust_diag(x, tau=tau, gamma=gamma).to(weight.device)
-            d_out = robust_diag(y, tau=tau, gamma=gamma).to(weight.device)
-            target = d_out[:, None] * weight.float() * d_in[None, :]
-            u_lat, v_lat = low_rank_binary_admm(target, rank=rank, iters=admm_iters, rho=rho, lamb=lamb)
-            u_sign, v_sign, s_out, s_in = balance_latent_factors(u_lat, v_lat)
-            out_scale = s_out / d_out
-            in_scale = s_in / d_in
-
-        u_lat, v_lat, out_scale, in_scale = tune_latent_ste(
-            x=x,
-            y=y,
-            u_lat=u_lat,
-            v_lat=v_lat,
-            out_scale=out_scale,
-            in_scale=in_scale,
-            steps=ste_steps,
-            lr=ste_lr,
-            progress_desc=progress_desc,
-        )
-
-        with torch.no_grad():
-            u_sign = sign_no_zero(u_lat)
-            v_sign = sign_no_zero(v_lat)
-            base_weight = (u_sign @ v_sign.t()) * in_scale[None, :]
-            pred = x @ base_weight.t()
-            out_scale = ((pred * y).sum(dim=0) / pred.pow(2).sum(dim=0).clamp_min(1e-8)).float()
-        return cls(
-            u_sign=u_sign,
-            v_sign=v_sign,
-            out_scale=out_scale,
-            in_scale=in_scale,
-            out_features=out_features,
-            in_features=in_features,
-        )
-
-    @torch.no_grad()
-    def dequantize(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        cache_key = (device, dtype)
-        cached = self._dequantized_cache.get(cache_key)
-        if cached is not None:
-            return cached
-        u = self.u_sign.to(device=device, dtype=torch.float32)
-        v = self.v_sign.to(device=device, dtype=torch.float32)
-        out_scale = self.out_scale.to(device=device, dtype=torch.float32)
-        in_scale = self.in_scale.to(device=device, dtype=torch.float32)
-        weight = out_scale[:, None] * (u @ v.t()) * in_scale[None, :]
-        weight = weight.to(dtype=dtype)
-        self._dequantized_cache[cache_key] = weight
-        return weight
-
-
-def quantize_linear_weight(module: nn.Module, name: str, activation: dict[str, torch.Tensor], progress_desc: Optional[str] = None) -> None:
-    weight = getattr(module, name)
-    quantized = NanoQuantLinearWeight.from_float(
-        weight.detach(),
-        activation=activation,
-        progress_desc=progress_desc,
-    )
-    del module._parameters[name]
-    setattr(module, name, quantized)
-
-
-def get_quantizable_weights(model: nn.Module, partial_quant: bool = False) -> list[tuple[str, nn.Module, str]]:
-    target_weights = {"wq", "wk", "wv", "wo", "wg", "wd", "wu"}
-    weights = []
-    for module_name, module in model.named_modules():
-        if partial_quant and not module_name.startswith("layers.0."):
-            continue
-        for name in target_weights:
-            if name in module._parameters:
-                full_name = f"{module_name}.{name}" if module_name else name
-                weights.append((full_name, module, name))
-    return weights
-
-
-def quantize_model_weights(
-    model: nn.Module,
-    activations: dict[str, torch.Tensor],
-    block_size: int = 128,
-    partial_quant: bool = False,
-    show_progress: bool = True,
-) -> None:
-    weights = get_quantizable_weights(model, partial_quant=partial_quant)
-    iterator = tqdm(weights, desc="Quantizing weights", leave=True) if show_progress else weights
-    for full_name, module, name in iterator:
-        if show_progress:
-            iterator.set_postfix_str(full_name)
-        quantize_linear_weight(
-            module,
-            name,
-            activation=activations[full_name],
-            progress_desc=f"Tune {full_name}" if show_progress else None,
-        )
-
-
-def collect_quantized_state_dict(model: nn.Module) -> dict[str, dict[str, torch.Tensor | int]]:
-    state_dict = {}
-    for module_name, module in model.named_modules():
-        for attr_name, value in module.__dict__.get("_modules", {}).items():
-            if isinstance(value, NanoQuantLinearWeight):
-                full_name = f"{module_name}.{attr_name}" if module_name else attr_name
-                state_dict[full_name] = {
-                    "type": "nanoquant",
-                    "u_sign": value.u_sign.cpu(),
-                    "v_sign": value.v_sign.cpu(),
-                    "out_scale": value.out_scale.cpu(),
-                    "in_scale": value.in_scale.cpu(),
-                    "in_features": value.in_features,
-                    "out_features": value.out_features,
-                }
-    return state_dict
-
-
-def load_quantized_state_dict(model: nn.Module, state_dict: dict[str, dict[str, torch.Tensor | int]]) -> None:
-    module_lookup = dict(model.named_modules())
-    iterator = tqdm(state_dict.items(), desc="Loading quant cache", leave=True)
-    for full_name, payload in iterator:
-        iterator.set_postfix_str(full_name)
-        module_name, attr_name = full_name.rsplit(".", 1)
-        module = module_lookup[module_name]
-        if attr_name in module._parameters:
-            del module._parameters[attr_name]
-        setattr(
-            module,
-            attr_name,
-            NanoQuantLinearWeight(
-                u_sign=payload["u_sign"],
-                v_sign=payload["v_sign"],
-                out_scale=payload["out_scale"],
-                in_scale=payload["in_scale"],
-                in_features=int(payload["in_features"]),
-                out_features=int(payload["out_features"]),
-            ),
-        )
-
-
-def linear(x: torch.Tensor, weight: torch.Tensor | NanoQuantLinearWeight) -> torch.Tensor:
-    if isinstance(weight, NanoQuantLinearWeight):
-        return torch.matmul(x, weight.dequantize(x.device, x.dtype).t())
+def linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return torch.matmul(x, weight.t())
-
-
-def flatten_activation(x: torch.Tensor) -> torch.Tensor:
-    return x.detach().reshape(-1, x.shape[-1]).to(device="cpu", dtype=torch.float16)
-
-
-def append_activation(capture: Optional[dict[str, list[torch.Tensor]]], key: str, value: torch.Tensor) -> None:
-    if capture is not None:
-        capture.setdefault(key, []).append(value)
 
 
 def precompute_freqs_cis(args: ModelArgs) -> tuple[torch.Tensor, torch.Tensor]:
@@ -404,10 +93,8 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class Attention(nn.Module):
-    def __init__(self, args: ModelArgs, layer_id: int):
+    def __init__(self, args: ModelArgs):
         super().__init__()
-        self.layer_id = layer_id
-        self.activation_capture: Optional[dict[str, list[torch.Tensor]]] = None
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         self.n_local_heads = args.n_heads
         self.n_local_kv_heads = self.n_kv_heads
@@ -441,16 +128,9 @@ class Attention(nn.Module):
         mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
         bsz, seqlen, _ = x.shape
-        if self.activation_capture is not None:
-            qkv_input = flatten_activation(x)
-            append_activation(self.activation_capture, f"layers.{self.layer_id}.attention.qkv", qkv_input)
         xq = linear(x, self.wq)      
         xk = linear(x, self.wk)
         xv = linear(x, self.wv)
-        if self.activation_capture is not None:
-            append_activation(self.activation_capture, f"layers.{self.layer_id}.attention.wq.y", flatten_activation(xq))
-            append_activation(self.activation_capture, f"layers.{self.layer_id}.attention.wk.y", flatten_activation(xk))
-            append_activation(self.activation_capture, f"layers.{self.layer_id}.attention.wv.y", flatten_activation(xv))
 
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
@@ -481,39 +161,20 @@ class Attention(nn.Module):
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
         output = torch.matmul(scores, values)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
-        if self.activation_capture is not None:
-            append_activation(self.activation_capture, f"layers.{self.layer_id}.attention.wo", flatten_activation(output))
-        out = linear(output, self.wo)
-        if self.activation_capture is not None:
-            append_activation(self.activation_capture, f"layers.{self.layer_id}.attention.wo.y", flatten_activation(out))
-        return out
+        return linear(output, self.wo)
 
 
 class FeedForward(nn.Module):
-    def __init__(self, args: ModelArgs, layer_id: int):
+    def __init__(self, args: ModelArgs):
         super().__init__()
-        self.layer_id = layer_id
-        self.activation_capture: Optional[dict[str, list[torch.Tensor]]] = None
         self.wg = nn.Parameter(torch.empty(args.hidden_dim, args.dim))
         self.wd = nn.Parameter(torch.empty(args.dim, args.hidden_dim))
         self.wu = nn.Parameter(torch.empty(args.hidden_dim, args.dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.activation_capture is not None:
-            wgu_input = flatten_activation(x)
-            append_activation(self.activation_capture, f"layers.{self.layer_id}.feed_forward.wgu", wgu_input)
         gate = linear(x, self.wg)
         up = linear(x, self.wu)
-        if self.activation_capture is not None:
-            append_activation(self.activation_capture, f"layers.{self.layer_id}.feed_forward.wg.y", flatten_activation(gate))
-            append_activation(self.activation_capture, f"layers.{self.layer_id}.feed_forward.wu.y", flatten_activation(up))
-        down_input = F.silu(gate) * up
-        if self.activation_capture is not None:
-            append_activation(self.activation_capture, f"layers.{self.layer_id}.feed_forward.wd", flatten_activation(down_input))
-        out = linear(down_input, self.wd)
-        if self.activation_capture is not None:
-            append_activation(self.activation_capture, f"layers.{self.layer_id}.feed_forward.wd.y", flatten_activation(out))
-        return out
+        return linear(F.silu(gate) * up, self.wd)
 
 
 class TransformerBlock(nn.Module):
@@ -522,8 +183,8 @@ class TransformerBlock(nn.Module):
         self.n_heads = args.n_heads
         self.dim = args.dim
         self.head_dim = args.dim // args.n_heads
-        self.attention = Attention(args, layer_id=layer_id)
-        self.feed_forward = FeedForward(args, layer_id=layer_id)
+        self.attention = Attention(args)
+        self.feed_forward = FeedForward(args)
         self.layer_id = layer_id
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
@@ -547,8 +208,6 @@ class Transformer(nn.Module):
         self.params = params
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
-        self.activation_capture: Optional[dict[str, list[torch.Tensor]]] = None
-        self.capture_layer_ids: set[int] = set()
 
         self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
         self.layers = nn.ModuleList([TransformerBlock(layer_id, params) for layer_id in range(params.n_layers)])
@@ -557,69 +216,6 @@ class Transformer(nn.Module):
         freqs_cos, freqs_sin = precompute_freqs_cis(params)
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
-
-    def start_activation_capture(self, layer_ids: set[int]) -> None:
-        self.activation_capture = {}
-        self.capture_layer_ids = layer_ids
-        for layer in self.layers:
-            capture = self.activation_capture if layer.layer_id in layer_ids else None
-            layer.attention.activation_capture = capture
-            layer.feed_forward.activation_capture = capture
-
-    def stop_activation_capture(self) -> None:
-        for layer in self.layers:
-            layer.attention.activation_capture = None
-            layer.feed_forward.activation_capture = None
-
-    def materialize_activation_capture(self, max_tokens: int, seed: int) -> dict[str, torch.Tensor]:
-        if self.activation_capture is None:
-            raise RuntimeError("activation capture was not started")
-
-        raw = {key: torch.cat(values, dim=0).float() for key, values in self.activation_capture.items()}
-        generator = torch.Generator().manual_seed(seed)
-        first_value = next(iter(raw.values()))
-        indices = None
-        if first_value.shape[0] > max_tokens:
-            indices = torch.randperm(first_value.shape[0], generator=generator)[:max_tokens]
-        sampled = {}
-        for key, value in raw.items():
-            if indices is not None:
-                value = value[indices]
-            sampled[key] = value
-
-        activations = {}
-        for layer_id in self.capture_layer_ids:
-            qkv = sampled[f"layers.{layer_id}.attention.qkv"]
-            activations[f"layers.{layer_id}.attention.wq"] = {
-                "x": qkv,
-                "y": sampled[f"layers.{layer_id}.attention.wq.y"],
-            }
-            activations[f"layers.{layer_id}.attention.wk"] = {
-                "x": qkv,
-                "y": sampled[f"layers.{layer_id}.attention.wk.y"],
-            }
-            activations[f"layers.{layer_id}.attention.wv"] = {
-                "x": qkv,
-                "y": sampled[f"layers.{layer_id}.attention.wv.y"],
-            }
-            activations[f"layers.{layer_id}.attention.wo"] = {
-                "x": sampled[f"layers.{layer_id}.attention.wo"],
-                "y": sampled[f"layers.{layer_id}.attention.wo.y"],
-            }
-            wgu = sampled[f"layers.{layer_id}.feed_forward.wgu"]
-            activations[f"layers.{layer_id}.feed_forward.wg"] = {
-                "x": wgu,
-                "y": sampled[f"layers.{layer_id}.feed_forward.wg.y"],
-            }
-            activations[f"layers.{layer_id}.feed_forward.wu"] = {
-                "x": wgu,
-                "y": sampled[f"layers.{layer_id}.feed_forward.wu.y"],
-            }
-            activations[f"layers.{layer_id}.feed_forward.wd"] = {
-                "x": sampled[f"layers.{layer_id}.feed_forward.wd"],
-                "y": sampled[f"layers.{layer_id}.feed_forward.wd.y"],
-            }
-        return activations
 
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int) -> torch.Tensor:

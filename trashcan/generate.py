@@ -1,5 +1,6 @@
 import time
 import builtins
+import hashlib
 import io
 import json
 import locale
@@ -9,27 +10,41 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+from datasets import load_dataset
 from safetensors.torch import load_file as load_safetensors_file
+from tqdm import tqdm
 from transformers import AutoTokenizer
 from transformers.utils.hub import cached_file
 
 try:
-    from .model import ModelArgs, Transformer
+    from .model import (
+        ModelArgs,
+        Transformer,
+        collect_quantized_state_dict,
+        get_quantizable_weights,
+        load_quantized_state_dict,
+        quantize_model_weights,
+    )
 except ImportError:
-    from model import ModelArgs, Transformer
+    from model import (
+        ModelArgs,
+        Transformer,
+        collect_quantized_state_dict,
+        get_quantizable_weights,
+        load_quantized_state_dict,
+        quantize_model_weights,
+    )
 
 
 HF_MODEL_ID = "LGAI-EXAONE/EXAONE-4.0-1.2B"
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 MODEL_ID = os.path.join(REPO_ROOT, "weight", "exaone4-1.2b")
 MODEL_PTH = "model.pth"
+QUANT_CACHE_DIR = os.path.join(os.path.dirname(__file__), "quant_cache")
 
 
 @contextmanager
 def force_utf8_locale():
-    # Transformers may read tokenizer sidecar files with the process default
-    # text encoding. Force UTF-8 briefly so the same code path works on
-    # Windows cp949 and on UTF-8-first Linux environments.
     original_getpreferredencoding = locale.getpreferredencoding
     original_getencoding = getattr(locale, "getencoding", None)
 
@@ -46,10 +61,6 @@ def force_utf8_locale():
 
 @contextmanager
 def force_utf8_chat_template_open():
-    # Some tokenizer repos ship `chat_template.jinja` as UTF-8 text.
-    # On Windows, Transformers may open it with the process default encoding
-    # (for example cp949), which raises a decode error. Intercept only plain
-    # text reads for that filename and leave every other file operation alone.
     original_open = builtins.open
     original_io_open = io.open
 
@@ -132,9 +143,8 @@ def load_model_config(model_id: str) -> dict:
 
 
 def load_hf_state_dict(model_id: str) -> dict[str, torch.Tensor]:
-    index_filename = "model.safetensors.index.json"
     try:
-        index_path = resolve_model_file(model_id, index_filename)
+        index_path = resolve_model_file(model_id, "model.safetensors.index.json")
     except Exception:
         index_path = None
 
@@ -166,6 +176,188 @@ def load_model_state_dict(model_id: str, n_layers: int) -> dict[str, torch.Tenso
     return convert_hf_state_dict(load_hf_state_dict(model_id), n_layers)
 
 
+def sample_start_positions(total_tokens: int, seq_len: int, num_samples: int, seed: int) -> list[int]:
+    max_start = total_tokens - seq_len - 1
+    if max_start < 0:
+        raise ValueError(f"Not enough calibration tokens for seq_len={seq_len}. total_tokens={total_tokens}")
+    generator = torch.Generator().manual_seed(seed)
+    return torch.randint(0, max_start + 1, (num_samples,), generator=generator).tolist()
+
+
+def normalize_target_set(value) -> Optional[set[str]]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        items = [item.strip() for item in value.split(",")]
+    else:
+        items = [str(item).strip() for item in value]
+    items = [item for item in items if item]
+    return set(items) if items else None
+
+
+def layer_ids_from_weights(weights: list[tuple[str, torch.nn.Module, str]]) -> set[int]:
+    layer_ids = set()
+    for full_name, _, _ in weights:
+        parts = full_name.split(".")
+        if len(parts) >= 2 and parts[0] == "layers":
+            layer_ids.add(int(parts[1]))
+    if not layer_ids:
+        raise ValueError("No transformer layer ids found for selected quantization targets.")
+    return layer_ids
+
+
+@torch.inference_mode()
+def collect_quant_activations(
+    model: Transformer,
+    tokenizer,
+    device: torch.device,
+    layer_ids: set[int],
+    seq_len: int,
+    num_samples: int,
+    seed: int,
+    max_tokens: int,
+) -> dict[str, torch.Tensor]:
+    layer_desc = "all layers" if len(layer_ids) == model.n_layers else f"layers {sorted(layer_ids)}"
+    print(f"Collecting calibration activations for {layer_desc}", flush=True)
+    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+    text = "\n\n".join(row for row in dataset["text"] if row.strip())
+    tokens = tokenizer(text, return_tensors="pt", add_special_tokens=False)["input_ids"][0]
+    starts = sample_start_positions(tokens.size(0), seq_len, num_samples, seed)
+
+    model.start_activation_capture(layer_ids)
+    for start in tqdm(starts, desc="Calibration samples", leave=True):
+        sample = tokens[start : start + seq_len].unsqueeze(0).to(device)
+        model.forward(sample, start_pos=0)
+    model.stop_activation_capture()
+    return model.materialize_activation_capture(max_tokens=max_tokens, seed=seed)
+
+
+def quant_cache_path(
+    model_id: str,
+    dtype: torch.dtype,
+    block_size: int,
+    partial_quant: bool,
+    target_modules: Optional[set[str]],
+    target_projections: Optional[set[str]],
+    exclude_projections: Optional[set[str]],
+    calib_seq_len: int,
+    calib_samples: int,
+    calib_seed: int,
+    calib_max_tokens: int,
+) -> str:
+    source_path = os.path.join(model_id, MODEL_PTH) if is_converted_model_dir(model_id) else model_id
+    source_mtime = os.path.getmtime(source_path) if os.path.exists(source_path) else 0
+    key = json.dumps(
+        {
+            "model_id": os.path.abspath(model_id) if os.path.exists(model_id) else model_id,
+            "source_mtime": source_mtime,
+            "dtype": str(dtype),
+            "block_size": block_size,
+            "partial_quant": partial_quant,
+            "target_modules": sorted(target_modules or []),
+            "target_projections": sorted(target_projections or []),
+            "exclude_projections": sorted(exclude_projections or []),
+            "calib_seq_len": calib_seq_len,
+            "calib_samples": calib_samples,
+            "calib_seed": calib_seed,
+            "calib_max_tokens": calib_max_tokens,
+            "algorithm": "nanoquant",
+            "target_bits": 1.0,
+            "admm_iters": 6,
+            "rho": 1.0,
+            "lambda": 1e-4,
+            "robust_tau": 0.2,
+            "robust_gamma": 0.2,
+            "ste_steps": 8,
+            "ste_lr": 5e-4,
+            "version": 5,
+        },
+        sort_keys=True,
+    )
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    os.makedirs(QUANT_CACHE_DIR, exist_ok=True)
+    scope = "partial" if partial_quant else "full"
+    return os.path.join(QUANT_CACHE_DIR, f"exaone4_1_2b_nanoquant_{scope}_bs{block_size}_{digest}.pt")
+
+
+def load_or_create_quant_cache(
+    model: Transformer,
+    tokenizer,
+    model_id: str,
+    device: torch.device,
+    dtype: torch.dtype,
+    block_size: int,
+    partial_quant: bool,
+    target_modules,
+    target_projections,
+    exclude_projections,
+    calib_seq_len: int,
+    calib_samples: int,
+    calib_seed: int,
+    calib_max_tokens: int,
+) -> None:
+    target_modules = normalize_target_set(target_modules)
+    target_projections = normalize_target_set(target_projections)
+    exclude_projections = normalize_target_set(exclude_projections)
+    selected_weights = get_quantizable_weights(
+        model,
+        partial_quant=partial_quant,
+        target_modules=target_modules,
+        target_projections=target_projections,
+        exclude_projections=exclude_projections,
+    )
+    if not selected_weights:
+        raise ValueError("No quantizable weights selected.")
+    print("Quant targets:", ", ".join(full_name for full_name, _, _ in selected_weights), flush=True)
+
+    cache_path = quant_cache_path(
+        model_id=model_id,
+        dtype=dtype,
+        block_size=block_size,
+        partial_quant=partial_quant,
+        target_modules=target_modules,
+        target_projections=target_projections,
+        exclude_projections=exclude_projections,
+        calib_seq_len=calib_seq_len,
+        calib_samples=calib_samples,
+        calib_seed=calib_seed,
+        calib_max_tokens=calib_max_tokens,
+    )
+    if os.path.exists(cache_path):
+        print(f"Loading quant cache: {cache_path}", flush=True)
+        try:
+            payload = torch.load(cache_path, map_location="cpu", weights_only=True)
+        except TypeError:
+            payload = torch.load(cache_path, map_location="cpu")
+        load_quantized_state_dict(model, payload["quantized_state_dict"])
+        return
+
+    print(f"Quant cache miss: {cache_path}", flush=True)
+    layer_ids = layer_ids_from_weights(selected_weights)
+    activations = collect_quant_activations(
+        model=model,
+        tokenizer=tokenizer,
+        device=device,
+        layer_ids=layer_ids,
+        seq_len=calib_seq_len,
+        num_samples=calib_samples,
+        seed=calib_seed,
+        max_tokens=calib_max_tokens,
+    )
+    quantize_model_weights(
+        model,
+        activations=activations,
+        block_size=block_size,
+        partial_quant=partial_quant,
+        target_modules=target_modules,
+        target_projections=target_projections,
+        exclude_projections=exclude_projections,
+        show_progress=True,
+    )
+    print(f"Saving quant cache: {cache_path}", flush=True)
+    torch.save({"quantized_state_dict": collect_quantized_state_dict(model)}, cache_path)
+
+
 class Llama:
     @staticmethod
     def build(
@@ -174,6 +366,15 @@ class Llama:
         max_batch_size: int = 1,
         dtype: Optional[torch.dtype] = None,
         device: Optional[str | torch.device] = None,
+        quant_block_size: int = 128,
+        partial_quant: bool = False,
+        target_module: Optional[str] = None,
+        target_projections: Optional[str] = None,
+        exclude_projections: Optional[str] = None,
+        calib_seq_len: int = 2048,
+        calib_samples: int = 8,
+        calib_seed: int = 99,
+        calib_max_tokens: int = 4096,
     ) -> "Llama":
         start_time = time.time()
         device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -205,8 +406,24 @@ class Llama:
         missing, unexpected = model.load_state_dict(checkpoint, strict=False)
         if missing or unexpected:
             raise RuntimeError(f"checkpoint mismatch: missing={missing}, unexpected={unexpected}")
+        load_or_create_quant_cache(
+            model=model,
+            tokenizer=tokenizer,
+            model_id=model_id,
+            device=device,
+            dtype=dtype,
+            block_size=quant_block_size,
+            partial_quant=partial_quant,
+            target_modules=target_module,
+            target_projections=target_projections,
+            exclude_projections=exclude_projections,
+            calib_seq_len=calib_seq_len,
+            calib_samples=calib_samples,
+            calib_seed=calib_seed,
+            calib_max_tokens=calib_max_tokens,
+        )
         model.eval()
-        print(f"Loaded in {time.time() - start_time:.2f} seconds")
+        print(f"Loaded quantized model in {time.time() - start_time:.2f} seconds")
         return Llama(model, tokenizer)
 
     def __init__(self, model: Transformer, tokenizer):
