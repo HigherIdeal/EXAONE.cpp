@@ -183,22 +183,24 @@ def sample_start_positions(total_tokens: int, seq_len: int, num_samples: int, se
 
 
 @torch.inference_mode()
-def collect_partial_quant_activations(
+def collect_quant_activations(
     model: Transformer,
     tokenizer,
     device: torch.device,
+    layer_ids: set[int],
     seq_len: int,
     num_samples: int,
     seed: int,
     max_tokens: int,
 ) -> dict[str, torch.Tensor]:
-    print("Collecting calibration activations for layer 0", flush=True)
+    layer_desc = "all layers" if len(layer_ids) == model.n_layers else f"layers {sorted(layer_ids)}"
+    print(f"Collecting calibration activations for {layer_desc}", flush=True)
     dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
     text = "\n\n".join(row for row in dataset["text"] if row.strip())
     tokens = tokenizer(text, return_tensors="pt", add_special_tokens=False)["input_ids"][0]
     starts = sample_start_positions(tokens.size(0), seq_len, num_samples, seed)
 
-    model.start_activation_capture({0})
+    model.start_activation_capture(layer_ids)
     for start in tqdm(starts, desc="Calibration samples", leave=True):
         sample = tokens[start : start + seq_len].unsqueeze(0).to(device)
         model.forward(sample, start_pos=0)
@@ -229,18 +231,23 @@ def quant_cache_path(
             "calib_samples": calib_samples,
             "calib_seed": calib_seed,
             "calib_max_tokens": calib_max_tokens,
-            "modes": list(("identity", "hadamard", "haar")),
-            "sigma_delta": True,
-            "sign_refine_iters": 2,
-            "max_flip_ratio": 0.02,
-            "version": 2,
+            "algorithm": "nanoquant",
+            "target_bits": 1.0,
+            "admm_iters": 6,
+            "rho": 1.0,
+            "lambda": 1e-4,
+            "robust_tau": 0.2,
+            "robust_gamma": 0.2,
+            "ste_steps": 8,
+            "ste_lr": 5e-4,
+            "version": 4,
         },
         sort_keys=True,
     )
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
     os.makedirs(QUANT_CACHE_DIR, exist_ok=True)
     scope = "partial" if partial_quant else "full"
-    return os.path.join(QUANT_CACHE_DIR, f"exaone4_1_2b_{scope}_bs{block_size}_{digest}.pt")
+    return os.path.join(QUANT_CACHE_DIR, f"exaone4_1_2b_nanoquant_{scope}_bs{block_size}_{digest}.pt")
 
 
 def load_or_create_quant_cache(
@@ -256,9 +263,6 @@ def load_or_create_quant_cache(
     calib_seed: int,
     calib_max_tokens: int,
 ) -> None:
-    if not partial_quant:
-        raise NotImplementedError("Full FM-SDBT calibration quantization is not implemented yet. Use --partial_quant.")
-
     cache_path = quant_cache_path(
         model_id=model_id,
         dtype=dtype,
@@ -279,10 +283,12 @@ def load_or_create_quant_cache(
         return
 
     print(f"Quant cache miss: {cache_path}", flush=True)
-    activations = collect_partial_quant_activations(
+    layer_ids = {0} if partial_quant else set(range(model.n_layers))
+    activations = collect_quant_activations(
         model=model,
         tokenizer=tokenizer,
         device=device,
+        layer_ids=layer_ids,
         seq_len=calib_seq_len,
         num_samples=calib_samples,
         seed=calib_seed,

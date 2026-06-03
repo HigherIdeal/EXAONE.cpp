@@ -1,14 +1,11 @@
 import math
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from tqdm import tqdm
-
-import sys
-torch.set_printoptions(precision=8)
 
 @dataclass
 class ModelArgs:
@@ -41,303 +38,204 @@ class RMSNorm(nn.Module):
         return self._norm(x.float()).type_as(x) * self.weight
 
 
-def is_power_of_two(value: int) -> bool:
-    return value > 0 and (value & (value - 1)) == 0
-
-
 def sign_no_zero(x: torch.Tensor) -> torch.Tensor:
     return torch.where(x >= 0, torch.ones_like(x), -torch.ones_like(x))
 
 
-def hadamard_transform(x: torch.Tensor) -> torch.Tensor:
-    n = x.shape[-1]
-    if not is_power_of_two(n):
-        return x
-
-    y = x.float()
-    h = 1
-    while h < n:
-        y = y.reshape(*y.shape[:-1], -1, h * 2)
-        left = y[..., :h]
-        right = y[..., h:]
-        y = torch.cat((left + right, left - right), dim=-1)
-        y = y.reshape(*y.shape[:-2], -1)
-        h *= 2
-    return y / math.sqrt(n)
+def sign_ste(x: torch.Tensor) -> torch.Tensor:
+    hard = sign_no_zero(x)
+    return x + (hard - x).detach()
 
 
-def haar_transform(x: torch.Tensor) -> torch.Tensor:
-    n = x.shape[-1]
-    if not is_power_of_two(n):
-        return x
-
-    current = x.float()
-    details = []
-    scale = math.sqrt(2.0)
-    while current.shape[-1] > 1:
-        even = current[..., 0::2]
-        odd = current[..., 1::2]
-        current = (even + odd) / scale
-        details.append((even - odd) / scale)
-    return torch.cat([current, *reversed(details)], dim=-1)
+def robust_diag(x: torch.Tensor, tau: float = 0.2, gamma: float = 0.2) -> torch.Tensor:
+    diag = x.float().pow(2).mean(dim=0).clamp_min(1e-8)
+    if diag.numel() > 1 and tau > 0:
+        threshold = torch.quantile(diag, min(1.0, 1.0 - tau))
+        diag = torch.minimum(diag, threshold)
+    return ((1.0 - gamma) * diag + gamma * diag.mean()).sqrt().clamp_min(1e-6)
 
 
-def inverse_haar_transform(coeffs: torch.Tensor) -> torch.Tensor:
-    n = coeffs.shape[-1]
-    if not is_power_of_two(n):
-        return coeffs
-
-    current = coeffs[..., :1].float()
-    offset = 1
-    scale = math.sqrt(2.0)
-    levels = int(math.log2(n))
-    for level in range(levels):
-        detail_len = 2**level
-        detail = coeffs[..., offset : offset + detail_len].float()
-        offset += detail_len
-        expanded = torch.empty(*current.shape[:-1], detail_len * 2, device=coeffs.device, dtype=torch.float32)
-        expanded[..., 0::2] = (current + detail) / scale
-        expanded[..., 1::2] = (current - detail) / scale
-        current = expanded
-    return current
+def nanoquant_rank(out_features: int, in_features: int, target_bits: float = 1.0) -> int:
+    rank = round(target_bits * out_features * in_features / (out_features + in_features))
+    return max(1, min(rank, out_features, in_features))
 
 
-def apply_weight_transform(x: torch.Tensor, mode_id: int) -> torch.Tensor:
-    if mode_id == 1:
-        return hadamard_transform(x)
-    if mode_id == 2:
-        return haar_transform(x)
-    return x.float()
-
-
-def invert_weight_transform(x: torch.Tensor, mode_id: int) -> torch.Tensor:
-    if mode_id == 1:
-        return hadamard_transform(x)
-    if mode_id == 2:
-        return inverse_haar_transform(x)
-    return x.float()
-
-
-def refine_signs(
-    coeffs: torch.Tensor,
-    signs: torch.Tensor,
-    h_diag: torch.Tensor,
-    alpha: torch.Tensor,
-    iters: int,
-    max_flip_ratio: float,
-) -> torch.Tensor:
-    if iters <= 0 or max_flip_ratio <= 0:
-        return signs
-
-    max_flips = max(1, int(coeffs.shape[-1] * max_flip_ratio))
-    for _ in range(iters):
-        current_error = h_diag * (coeffs - alpha * signs).pow(2)
-        flipped_error = h_diag * (coeffs + alpha * signs).pow(2)
-        improvement = current_error - flipped_error
-        candidates = improvement > 0
-        if not bool(candidates.any()):
-            break
-
-        scores = improvement.masked_fill(~candidates, float("-inf"))
-        flip_count = min(max_flips, scores.shape[-1])
-        _, indices = torch.topk(scores, k=flip_count, dim=-1)
-        row_has_flip = torch.isfinite(torch.gather(scores, -1, indices))
-        flip_mask = torch.zeros_like(signs, dtype=torch.bool)
-        flip_mask.scatter_(-1, indices, row_has_flip)
-        signs = torch.where(flip_mask, -signs, signs)
-        numerator = (h_diag * coeffs * signs).sum(dim=-1, keepdim=True)
-        denominator = h_diag.sum().clamp_min(1e-12)
-        alpha = numerator / denominator
-    return signs
-
-
-def sigma_delta_signs(coeffs: torch.Tensor, h_diag: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
-    adjusted = coeffs.float().clone()
-    signs = torch.empty_like(adjusted)
-    high_to_low = torch.argsort(h_diag.flatten(), descending=True).tolist()
-    low_to_high = torch.argsort(h_diag.flatten(), descending=False).tolist()
-    remaining = set(high_to_low)
-
-    for coeff_index in high_to_low:
-        remaining.discard(coeff_index)
-        value = adjusted[:, coeff_index]
-        sign = sign_no_zero(value)
-        signs[:, coeff_index] = sign
-        residual = value - alpha.squeeze(-1) * sign
-        for target_index in low_to_high:
-            if target_index in remaining:
-                adjusted[:, target_index] += residual
-                break
-    return signs
-
-
-def output_cost(target: torch.Tensor, pred: torch.Tensor, gamma: float = 0.01) -> torch.Tensor:
-    target = target.float()
-    pred = pred.float()
-    rel_mse = (target - pred).pow(2).mean(dim=0) / target.pow(2).mean(dim=0).clamp_min(1e-8)
-    cosine = F.cosine_similarity(target, pred, dim=0, eps=1e-8)
-    return rel_mse + gamma * (1.0 - cosine)
-
-
-def fisher_scale(coeffs: torch.Tensor, signs: torch.Tensor, h_diag: torch.Tensor) -> torch.Tensor:
-    numerator = (h_diag * coeffs * signs).sum(dim=-1, keepdim=True)
-    denominator = h_diag.sum().clamp_min(1e-12)
-    return numerator / denominator
-
-
-def refine_signs_with_output_cost(
-    coeffs: torch.Tensor,
-    signs: torch.Tensor,
-    alpha: torch.Tensor,
-    z_block: torch.Tensor,
-    target: torch.Tensor,
-    h_diag: torch.Tensor,
-    iters: int,
-    max_flip_ratio: float,
+def low_rank_binary_admm(
+    weight: torch.Tensor,
+    rank: int,
+    iters: int = 6,
+    rho: float = 1.0,
+    lamb: float = 1e-4,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if iters <= 0 or max_flip_ratio <= 0:
-        return signs, alpha
+    u, s, vh = torch.linalg.svd(weight.float(), full_matrices=False)
+    rank = min(rank, s.numel())
+    root_s = s[:rank].sqrt()
+    u_lat = u[:, :rank] * root_s
+    v_lat = vh[:rank, :].t() * root_s
+    u_bin = sign_no_zero(u_lat)
+    v_bin = sign_no_zero(v_lat)
+    u_dual = torch.zeros_like(u_lat)
+    v_dual = torch.zeros_like(v_lat)
+    eye = torch.eye(rank, device=weight.device, dtype=torch.float32)
 
-    max_flips = max(1, int(coeffs.shape[-1] * max_flip_ratio))
     for _ in range(iters):
-        pred = z_block @ (alpha * signs).t()
-        current_cost = output_cost(target, pred)
-        weighted_error = h_diag * (coeffs - alpha * signs).pow(2)
-        near_scale = -((coeffs.abs() - alpha.abs()).abs())
-        scores = weighted_error + 0.01 * near_scale
-        candidate_indices = torch.topk(scores, k=max_flips, dim=-1).indices
+        lhs = v_lat.t() @ v_lat + (rho + lamb) * eye
+        rhs = weight.float() @ v_lat + rho * (u_bin - u_dual)
+        u_lat = torch.linalg.solve(lhs, rhs.t()).t()
+        u_bin = sign_no_zero(u_lat + u_dual)
+        u_dual = u_dual + u_lat - u_bin
 
-        accepted = False
-        for row in range(signs.shape[0]):
-            row_pred = pred[:, row]
-            row_cost = current_cost[row]
-            for coeff_index in candidate_indices[row].tolist():
-                delta = -2.0 * alpha[row, 0] * signs[row, coeff_index] * z_block[:, coeff_index]
-                new_cost = output_cost(target[:, row : row + 1], (row_pred + delta)[:, None])[0]
-                if bool(new_cost < row_cost):
-                    signs[row, coeff_index] = -signs[row, coeff_index]
-                    row_pred = row_pred + delta
-                    row_cost = new_cost
-                    accepted = True
+        lhs = u_lat.t() @ u_lat + (rho + lamb) * eye
+        rhs = weight.float().t() @ u_lat + rho * (v_bin - v_dual)
+        v_lat = torch.linalg.solve(lhs, rhs.t()).t()
+        v_bin = sign_no_zero(v_lat + v_dual)
+        v_dual = v_dual + v_lat - v_bin
 
-        if not accepted:
-            break
-        alpha = fisher_scale(coeffs, signs, h_diag)
-    return signs, alpha
+    return u_lat, v_lat
 
 
-class QuantizedLinearWeight(nn.Module):
-    MODE_NAMES = ("identity", "hadamard", "haar")
+def balance_latent_factors(u_lat: torch.Tensor, v_lat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    factor = (v_lat.norm().clamp_min(1e-8) / u_lat.norm().clamp_min(1e-8)).sqrt()
+    u_bal = u_lat * factor
+    v_bal = v_lat / factor
+    s_out = u_bal.abs().mean(dim=1).clamp_min(1e-6)
+    s_in = v_bal.abs().mean(dim=1).clamp_min(1e-6)
+    return sign_no_zero(u_bal / s_out[:, None]), sign_no_zero(v_bal / s_in[:, None]), s_out, s_in
 
+
+def nanoquant_weight(
+    u: torch.Tensor,
+    v: torch.Tensor,
+    out_scale: torch.Tensor,
+    in_scale: torch.Tensor,
+    ste: bool = False,
+) -> torch.Tensor:
+    u_bin = sign_ste(u) if ste else sign_no_zero(u)
+    v_bin = sign_ste(v) if ste else sign_no_zero(v)
+    return out_scale[:, None] * (u_bin @ v_bin.t()) * in_scale[None, :]
+
+
+def tune_latent_ste(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    u_lat: torch.Tensor,
+    v_lat: torch.Tensor,
+    out_scale: torch.Tensor,
+    in_scale: torch.Tensor,
+    steps: int = 8,
+    lr: float = 5e-4,
+    progress_desc: Optional[str] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if steps <= 0:
+        return u_lat, v_lat, out_scale, in_scale
+
+    u_param = nn.Parameter(u_lat.float())
+    v_param = nn.Parameter(v_lat.float())
+    out_scale_param = nn.Parameter(out_scale.float())
+    in_scale_param = nn.Parameter(in_scale.float())
+    optimizer = torch.optim.AdamW(
+        [u_param, v_param, out_scale_param, in_scale_param],
+        lr=lr,
+        weight_decay=0.0,
+    )
+    target_norm = y.pow(2).mean().clamp_min(1e-8)
+    iterator = range(steps)
+    if progress_desc is not None:
+        iterator = tqdm(iterator, desc=progress_desc, leave=False)
+
+    for _ in iterator:
+        optimizer.zero_grad(set_to_none=True)
+        weight_hat = nanoquant_weight(u_param, v_param, out_scale_param, in_scale_param, ste=True)
+        pred = x @ weight_hat.t()
+        loss = (pred - y).pow(2).mean() / target_norm
+        loss.backward()
+        optimizer.step()
+        if progress_desc is not None:
+            iterator.set_postfix_str(f"loss={float(loss.detach().cpu()):.4f}")
+
+    return (
+        u_param.detach(),
+        v_param.detach(),
+        out_scale_param.detach(),
+        in_scale_param.detach(),
+    )
+
+
+class NanoQuantLinearWeight(nn.Module):
     def __init__(
         self,
-        signs: torch.Tensor,
-        scales: torch.Tensor,
-        mode_ids: torch.Tensor,
-        block_size: int,
-        in_features: int,
+        u_sign: torch.Tensor,
+        v_sign: torch.Tensor,
+        out_scale: torch.Tensor,
+        in_scale: torch.Tensor,
         out_features: int,
+        in_features: int,
     ):
         super().__init__()
-        self.block_size = block_size
-        self.in_features = in_features
         self.out_features = out_features
-        self.register_buffer("signs", signs.to(torch.int8), persistent=True)
-        self.register_buffer("scales", scales, persistent=True)
-        self.register_buffer("mode_ids", mode_ids.to(torch.uint8), persistent=True)
+        self.in_features = in_features
+        self.rank = u_sign.shape[1]
+        self.register_buffer("u_sign", u_sign.to(torch.int8), persistent=True)
+        self.register_buffer("v_sign", v_sign.to(torch.int8), persistent=True)
+        self.register_buffer("out_scale", out_scale.to(torch.float16), persistent=True)
+        self.register_buffer("in_scale", in_scale.to(torch.float16), persistent=True)
         self._dequantized_cache: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
 
     @classmethod
-    @torch.no_grad()
     def from_float(
         cls,
         weight: torch.Tensor,
-        activation: torch.Tensor,
-        block_size: int = 128,
-        modes: Sequence[str] = MODE_NAMES,
-        scale_dtype: torch.dtype = torch.float16,
-        sigma_delta: bool = True,
-        sign_refine_iters: int = 2,
-        max_flip_ratio: float = 0.02,
+        activation: dict[str, torch.Tensor],
+        target_bits: float = 1.0,
+        rank: Optional[int] = None,
+        admm_iters: int = 6,
+        rho: float = 1.0,
+        lamb: float = 1e-4,
+        tau: float = 0.2,
+        gamma: float = 0.2,
+        ste_steps: int = 8,
+        ste_lr: float = 5e-4,
         progress_desc: Optional[str] = None,
-    ) -> "QuantizedLinearWeight":
-        out_features, in_features = weight.shape
-        if in_features % block_size != 0:
-            raise ValueError(f"in_features={in_features} must be divisible by block_size={block_size}")
-        if activation is None:
-            raise ValueError("FM-SDBT requires calibration activation for every quantized weight.")
+    ) -> "NanoQuantLinearWeight":
+        with torch.no_grad():
+            x = activation["x"].to(device=weight.device, dtype=torch.float32)
+            y = activation["y"].to(device=weight.device, dtype=torch.float32)
+            out_features, in_features = weight.shape
+            rank = rank or nanoquant_rank(out_features, in_features, target_bits=target_bits)
 
-        mode_to_id = {name: index for index, name in enumerate(cls.MODE_NAMES)}
-        mode_ids_to_try = [mode_to_id[name] for name in modes]
-        n_blocks = in_features // block_size
-        all_signs = torch.empty(out_features, in_features, device=weight.device, dtype=torch.int8)
-        all_scales = torch.empty(out_features, n_blocks, device=weight.device, dtype=scale_dtype)
-        all_modes = torch.empty(out_features, n_blocks, device=weight.device, dtype=torch.uint8)
+            d_in = robust_diag(x, tau=tau, gamma=gamma).to(weight.device)
+            d_out = robust_diag(y, tau=tau, gamma=gamma).to(weight.device)
+            target = d_out[:, None] * weight.float() * d_in[None, :]
+            u_lat, v_lat = low_rank_binary_admm(target, rank=rank, iters=admm_iters, rho=rho, lamb=lamb)
+            u_sign, v_sign, s_out, s_in = balance_latent_factors(u_lat, v_lat)
+            out_scale = s_out / d_out
+            in_scale = s_in / d_in
 
-        block_iter = range(n_blocks)
-        if progress_desc is not None:
-            block_iter = tqdm(block_iter, desc=progress_desc, leave=False)
-        for block_index in block_iter:
-            start = block_index * block_size
-            end = start + block_size
-            block = weight[:, start:end].float()
-            x_block = activation[:, start:end].to(device=weight.device, dtype=torch.float32)
-            target = x_block @ block.t()
-            best_error = None
-            best_signs = None
-            best_scales = None
-            best_modes = None
+        u_lat, v_lat, out_scale, in_scale = tune_latent_ste(
+            x=x,
+            y=y,
+            u_lat=u_lat,
+            v_lat=v_lat,
+            out_scale=out_scale,
+            in_scale=in_scale,
+            steps=ste_steps,
+            lr=ste_lr,
+            progress_desc=progress_desc,
+        )
 
-            for mode_id in mode_ids_to_try:
-                coeffs = apply_weight_transform(block, mode_id)
-                z_block = apply_weight_transform(x_block, mode_id)
-                h_diag = z_block.pow(2).mean(dim=0, keepdim=True).clamp_min(1e-8)
-                signs = sign_no_zero(coeffs)
-                alpha = fisher_scale(coeffs, signs, h_diag)
-                if sigma_delta:
-                    signs = sigma_delta_signs(coeffs, h_diag, alpha)
-                    alpha = fisher_scale(coeffs, signs, h_diag)
-                signs, alpha = refine_signs_with_output_cost(
-                    coeffs=coeffs,
-                    signs=signs,
-                    alpha=alpha,
-                    z_block=z_block,
-                    target=target,
-                    h_diag=h_diag,
-                    iters=sign_refine_iters,
-                    max_flip_ratio=max_flip_ratio,
-                )
-                pred = z_block @ (alpha * signs).t()
-                error = output_cost(target, pred)
-
-                if best_error is None:
-                    best_error = error
-                    best_signs = signs
-                    best_scales = alpha.squeeze(-1)
-                    best_modes = torch.full((out_features,), mode_id, device=weight.device, dtype=torch.uint8)
-                    continue
-
-                improved = error < best_error
-                best_error = torch.where(improved, error, best_error)
-                best_signs = torch.where(improved[:, None], signs, best_signs)
-                best_scales = torch.where(improved, alpha.squeeze(-1), best_scales)
-                best_modes = torch.where(
-                    improved,
-                    torch.full_like(best_modes, mode_id, dtype=torch.uint8),
-                    best_modes,
-                )
-
-            all_signs[:, start:end] = best_signs.to(torch.int8)
-            all_scales[:, block_index] = best_scales.to(scale_dtype)
-            all_modes[:, block_index] = best_modes
-
+        with torch.no_grad():
+            u_sign = sign_no_zero(u_lat)
+            v_sign = sign_no_zero(v_lat)
+            base_weight = (u_sign @ v_sign.t()) * in_scale[None, :]
+            pred = x @ base_weight.t()
+            out_scale = ((pred * y).sum(dim=0) / pred.pow(2).sum(dim=0).clamp_min(1e-8)).float()
         return cls(
-            signs=all_signs,
-            scales=all_scales,
-            mode_ids=all_modes,
-            block_size=block_size,
-            in_features=in_features,
+            u_sign=u_sign,
+            v_sign=v_sign,
+            out_scale=out_scale,
+            in_scale=in_scale,
             out_features=out_features,
+            in_features=in_features,
         )
 
     @torch.no_grad()
@@ -346,40 +244,21 @@ class QuantizedLinearWeight(nn.Module):
         cached = self._dequantized_cache.get(cache_key)
         if cached is not None:
             return cached
-
-        weight = torch.empty(self.out_features, self.in_features, device=device, dtype=torch.float32)
-        signs = self.signs.to(device=device)
-        scales = self.scales.to(device=device, dtype=torch.float32)
-        mode_ids = self.mode_ids.to(device=device)
-        n_blocks = self.in_features // self.block_size
-
-        for block_index in range(n_blocks):
-            start = block_index * self.block_size
-            end = start + self.block_size
-            coeffs = signs[:, start:end].float() * scales[:, block_index : block_index + 1]
-
-            for mode_id in range(len(self.MODE_NAMES)):
-                rows = mode_ids[:, block_index] == mode_id
-                if bool(rows.any()):
-                    weight[rows, start:end] = invert_weight_transform(coeffs[rows], mode_id)
-
-        quantized_weight = weight.to(dtype=dtype)
-        self._dequantized_cache[cache_key] = quantized_weight
-        return quantized_weight
+        u = self.u_sign.to(device=device, dtype=torch.float32)
+        v = self.v_sign.to(device=device, dtype=torch.float32)
+        out_scale = self.out_scale.to(device=device, dtype=torch.float32)
+        in_scale = self.in_scale.to(device=device, dtype=torch.float32)
+        weight = out_scale[:, None] * (u @ v.t()) * in_scale[None, :]
+        weight = weight.to(dtype=dtype)
+        self._dequantized_cache[cache_key] = weight
+        return weight
 
 
-def quantize_linear_weight(
-    module: nn.Module,
-    name: str,
-    activation: torch.Tensor,
-    block_size: int = 128,
-    progress_desc: Optional[str] = None,
-) -> None:
+def quantize_linear_weight(module: nn.Module, name: str, activation: dict[str, torch.Tensor], progress_desc: Optional[str] = None) -> None:
     weight = getattr(module, name)
-    quantized = QuantizedLinearWeight.from_float(
+    quantized = NanoQuantLinearWeight.from_float(
         weight.detach(),
         activation=activation,
-        block_size=block_size,
         progress_desc=progress_desc,
     )
     del module._parameters[name]
@@ -415,8 +294,7 @@ def quantize_model_weights(
             module,
             name,
             activation=activations[full_name],
-            block_size=block_size,
-            progress_desc=f"Blocks {full_name}" if show_progress else None,
+            progress_desc=f"Tune {full_name}" if show_progress else None,
         )
 
 
@@ -424,13 +302,14 @@ def collect_quantized_state_dict(model: nn.Module) -> dict[str, dict[str, torch.
     state_dict = {}
     for module_name, module in model.named_modules():
         for attr_name, value in module.__dict__.get("_modules", {}).items():
-            if isinstance(value, QuantizedLinearWeight):
+            if isinstance(value, NanoQuantLinearWeight):
                 full_name = f"{module_name}.{attr_name}" if module_name else attr_name
                 state_dict[full_name] = {
-                    "signs": value.signs.cpu(),
-                    "scales": value.scales.cpu(),
-                    "mode_ids": value.mode_ids.cpu(),
-                    "block_size": value.block_size,
+                    "type": "nanoquant",
+                    "u_sign": value.u_sign.cpu(),
+                    "v_sign": value.v_sign.cpu(),
+                    "out_scale": value.out_scale.cpu(),
+                    "in_scale": value.in_scale.cpu(),
                     "in_features": value.in_features,
                     "out_features": value.out_features,
                 }
@@ -449,19 +328,19 @@ def load_quantized_state_dict(model: nn.Module, state_dict: dict[str, dict[str, 
         setattr(
             module,
             attr_name,
-            QuantizedLinearWeight(
-                signs=payload["signs"],
-                scales=payload["scales"],
-                mode_ids=payload["mode_ids"],
-                block_size=int(payload["block_size"]),
+            NanoQuantLinearWeight(
+                u_sign=payload["u_sign"],
+                v_sign=payload["v_sign"],
+                out_scale=payload["out_scale"],
+                in_scale=payload["in_scale"],
                 in_features=int(payload["in_features"]),
                 out_features=int(payload["out_features"]),
             ),
         )
 
 
-def linear(x: torch.Tensor, weight: torch.Tensor | QuantizedLinearWeight) -> torch.Tensor:
-    if isinstance(weight, QuantizedLinearWeight):
+def linear(x: torch.Tensor, weight: torch.Tensor | NanoQuantLinearWeight) -> torch.Tensor:
+    if isinstance(weight, NanoQuantLinearWeight):
         return torch.matmul(x, weight.dequantize(x.device, x.dtype).t())
     return torch.matmul(x, weight.t())
 
@@ -568,6 +447,10 @@ class Attention(nn.Module):
         xq = linear(x, self.wq)      
         xk = linear(x, self.wk)
         xv = linear(x, self.wv)
+        if self.activation_capture is not None:
+            append_activation(self.activation_capture, f"layers.{self.layer_id}.attention.wq.y", flatten_activation(xq))
+            append_activation(self.activation_capture, f"layers.{self.layer_id}.attention.wk.y", flatten_activation(xk))
+            append_activation(self.activation_capture, f"layers.{self.layer_id}.attention.wv.y", flatten_activation(xv))
 
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
@@ -600,7 +483,10 @@ class Attention(nn.Module):
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         if self.activation_capture is not None:
             append_activation(self.activation_capture, f"layers.{self.layer_id}.attention.wo", flatten_activation(output))
-        return linear(output, self.wo)
+        out = linear(output, self.wo)
+        if self.activation_capture is not None:
+            append_activation(self.activation_capture, f"layers.{self.layer_id}.attention.wo.y", flatten_activation(out))
+        return out
 
 
 class FeedForward(nn.Module):
@@ -618,10 +504,16 @@ class FeedForward(nn.Module):
             append_activation(self.activation_capture, f"layers.{self.layer_id}.feed_forward.wgu", wgu_input)
         gate = linear(x, self.wg)
         up = linear(x, self.wu)
+        if self.activation_capture is not None:
+            append_activation(self.activation_capture, f"layers.{self.layer_id}.feed_forward.wg.y", flatten_activation(gate))
+            append_activation(self.activation_capture, f"layers.{self.layer_id}.feed_forward.wu.y", flatten_activation(up))
         down_input = F.silu(gate) * up
         if self.activation_capture is not None:
             append_activation(self.activation_capture, f"layers.{self.layer_id}.feed_forward.wd", flatten_activation(down_input))
-        return linear(down_input, self.wd)
+        out = linear(down_input, self.wd)
+        if self.activation_capture is not None:
+            append_activation(self.activation_capture, f"layers.{self.layer_id}.feed_forward.wd.y", flatten_activation(out))
+        return out
 
 
 class TransformerBlock(nn.Module):
@@ -685,24 +577,48 @@ class Transformer(nn.Module):
 
         raw = {key: torch.cat(values, dim=0).float() for key, values in self.activation_capture.items()}
         generator = torch.Generator().manual_seed(seed)
+        first_value = next(iter(raw.values()))
+        indices = None
+        if first_value.shape[0] > max_tokens:
+            indices = torch.randperm(first_value.shape[0], generator=generator)[:max_tokens]
         sampled = {}
         for key, value in raw.items():
-            if value.shape[0] > max_tokens:
-                indices = torch.randperm(value.shape[0], generator=generator)[:max_tokens]
+            if indices is not None:
                 value = value[indices]
             sampled[key] = value
 
         activations = {}
         for layer_id in self.capture_layer_ids:
             qkv = sampled[f"layers.{layer_id}.attention.qkv"]
-            activations[f"layers.{layer_id}.attention.wq"] = qkv
-            activations[f"layers.{layer_id}.attention.wk"] = qkv
-            activations[f"layers.{layer_id}.attention.wv"] = qkv
-            activations[f"layers.{layer_id}.attention.wo"] = sampled[f"layers.{layer_id}.attention.wo"]
+            activations[f"layers.{layer_id}.attention.wq"] = {
+                "x": qkv,
+                "y": sampled[f"layers.{layer_id}.attention.wq.y"],
+            }
+            activations[f"layers.{layer_id}.attention.wk"] = {
+                "x": qkv,
+                "y": sampled[f"layers.{layer_id}.attention.wk.y"],
+            }
+            activations[f"layers.{layer_id}.attention.wv"] = {
+                "x": qkv,
+                "y": sampled[f"layers.{layer_id}.attention.wv.y"],
+            }
+            activations[f"layers.{layer_id}.attention.wo"] = {
+                "x": sampled[f"layers.{layer_id}.attention.wo"],
+                "y": sampled[f"layers.{layer_id}.attention.wo.y"],
+            }
             wgu = sampled[f"layers.{layer_id}.feed_forward.wgu"]
-            activations[f"layers.{layer_id}.feed_forward.wg"] = wgu
-            activations[f"layers.{layer_id}.feed_forward.wu"] = wgu
-            activations[f"layers.{layer_id}.feed_forward.wd"] = sampled[f"layers.{layer_id}.feed_forward.wd"]
+            activations[f"layers.{layer_id}.feed_forward.wg"] = {
+                "x": wgu,
+                "y": sampled[f"layers.{layer_id}.feed_forward.wg.y"],
+            }
+            activations[f"layers.{layer_id}.feed_forward.wu"] = {
+                "x": wgu,
+                "y": sampled[f"layers.{layer_id}.feed_forward.wu.y"],
+            }
+            activations[f"layers.{layer_id}.feed_forward.wd"] = {
+                "x": sampled[f"layers.{layer_id}.feed_forward.wd"],
+                "y": sampled[f"layers.{layer_id}.feed_forward.wd.y"],
+            }
         return activations
 
     @torch.inference_mode()

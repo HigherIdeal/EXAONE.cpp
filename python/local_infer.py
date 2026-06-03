@@ -6,7 +6,7 @@ import time
 
 import torch
 
-from src.generate import Llama, MODEL_ID, sample_top_p
+from src.generate import MODEL_ID
 
 
 def visible_text(text: str) -> str:
@@ -38,12 +38,13 @@ def parse_torch_dtype(value: str) -> torch.dtype:
 
 @torch.inference_mode()
 def stream_generate_text(
-    generator: Llama,
+    generator,
     input_ids: list[int],
     max_new_tokens: int,
     temperature: float,
     top_p: float,
     tokens_per_sec: float,
+    sample_top_p,
 ) -> list[int]:
     model = generator.model
     tokenizer = generator.tokenizer
@@ -103,26 +104,50 @@ def main() -> None:
     parser.add_argument("--prompt", default="자기소개해봐.")
     parser.add_argument("--max-seq-len", type=int, default=2048)
     parser.add_argument("--max-new-tokens", type=int, default=1024)
-    parser.add_argument("--temperature", type=float, default=0.6)
+    parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--reasoning", action="store_true")
     parser.add_argument("--show-tokens", action="store_true")
+    parser.add_argument("--quant", action="store_true", help="Use the quantized model path under python/quant.")
+    parser.add_argument("--partial_quant", "--partial-quant", action="store_true", help="Quantize only transformer layer 0.")
+    parser.add_argument("--quant-block-size", type=int, default=128)
+    parser.add_argument("--calib-seq-len", type=int, default=2048)
+    parser.add_argument("--calib-samples", type=int, default=8)
+    parser.add_argument("--calib-seed", type=int, default=99)
+    parser.add_argument("--calib-max-tokens", type=int, default=4096)
     parser.add_argument(
         "--torch-dtype",
         type=parse_torch_dtype,
-        default=torch.bfloat16,
+        default=torch.float16,
         choices=tuple(DTYPE_MAP.values()),
         metavar="{" + ",".join(DTYPE_MAP) + "}",
         help="Torch dtype to use when loading and running the model. Default: bfloat16",
     )
     args = parser.parse_args()
 
-    generator = Llama.build(
-        model_id=args.model_id,
-        max_seq_len=args.max_seq_len,
-        max_batch_size=1,
-        dtype=args.torch_dtype,
-    )
+    if args.partial_quant:
+        args.quant = True
+
+    if args.quant:
+        from quant.generate import Llama, sample_top_p
+    else:
+        from src.generate import Llama, sample_top_p
+
+    build_kwargs = {
+        "model_id": args.model_id,
+        "max_seq_len": args.max_seq_len,
+        "max_batch_size": 1,
+        "dtype": args.torch_dtype,
+    }
+    if args.quant:
+        build_kwargs["quant_block_size"] = args.quant_block_size
+        build_kwargs["partial_quant"] = args.partial_quant
+        build_kwargs["calib_seq_len"] = args.calib_seq_len
+        build_kwargs["calib_samples"] = args.calib_samples
+        build_kwargs["calib_seed"] = args.calib_seed
+        build_kwargs["calib_max_tokens"] = args.calib_max_tokens
+
+    generator = Llama.build(**build_kwargs)
 
     tokenizer = generator.tokenizer
     inputs = tokenizer.apply_chat_template(
@@ -147,6 +172,7 @@ def main() -> None:
         temperature=args.temperature,
         top_p=args.top_p,
         tokens_per_sec=STREAM_TOKENS_PER_SEC,
+        sample_top_p=sample_top_p,
     )
     
 
