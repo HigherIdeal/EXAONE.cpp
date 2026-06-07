@@ -82,7 +82,7 @@ The intermediate BF16 pattern and packed byte are:
 
 ```text
 BF16 intermediate: S | 0111xxxx | xxx0000
-Packed FP8:         S | xxxx     | xxx
+Packed FP8:        S |     xxxx | xxx
 ```
 
 Normalization weights remain raw BF16. The binary contains 332 ordered weight
