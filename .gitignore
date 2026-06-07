@@ -3,3 +3,6 @@
 plan/
 exaone4-1.2b/
 weight/EXAONE*/
+cpp/build/
+cpp/.vs
+weight/test.py
