@@ -17,6 +17,10 @@ LGAI-EXAONE/EXAONE-4.0-1.2B
 - Inference-only execution
 - Custom FP8 E4M3 weight storage
 - 64-byte-aligned binary weights for SIMD-friendly access
+- FlashAttention1/2 implementation
+  Reference: [Dao-AILab/flash-attention](https://github.com/Dao-AILab/flash-attention)
+- CFHead implementation
+  Reference: [HigherIdeal/CFHead](https://github.com/HigherIdeal/CFHead)
 - Research and non-commercial use
 
 This project does not provide model training, fine-tuning, or official EXAONE
