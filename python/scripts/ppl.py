@@ -2,13 +2,18 @@
 
 import argparse
 import math
+import sys
+from pathlib import Path
+
+PYTHON_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PYTHON_DIR))
 
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
 from tqdm import tqdm
 
-from src.generate import MODEL_ID
+from src.generate import Llama, MODEL_ID
 
 
 DTYPE_MAP = {
@@ -53,58 +58,33 @@ def compute_sample_nll(model, input_ids: torch.Tensor) -> float:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-id", default=MODEL_ID)
+    parser.add_argument(
+        "--model-id",
+        default=MODEL_ID,
+        help=f"Local model directory or Hugging Face model ID. Default: {MODEL_ID}",
+    )
     parser.add_argument("--max-seq-len", type=int, default=2048)
     parser.add_argument("--seq-len", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=99)
-    parser.add_argument("--num-samples", type=int, default=8)
+    parser.add_argument("--num-samples", type=int, default=4)
     parser.add_argument("--split", default="test")
-    parser.add_argument("--quant", action="store_true", help="Use the quantized model path under python/quant.")
-    parser.add_argument("--partial_quant", "--partial-quant", action="store_true", help="Quantize only transformer layer 0.")
-    parser.add_argument("--quant-block-size", type=int, default=128)
-    parser.add_argument("--target-module", default=None, help="Quantize one exact module, e.g. layers.0.attention.wq.")
-    parser.add_argument("--target-projections", default=None, help="Comma-separated projection names, e.g. wq,wk,wv,wo.")
-    parser.add_argument("--exclude-projections", default=None, help="Comma-separated projection names to skip, e.g. wd.")
-    parser.add_argument("--calib-seq-len", type=int, default=2048)
-    parser.add_argument("--calib-samples", type=int, default=8)
-    parser.add_argument("--calib-seed", type=int, default=99)
-    parser.add_argument("--calib-max-tokens", type=int, default=4096)
     parser.add_argument(
         "--torch-dtype",
         type=str,
-        default="float16",
+        default="bfloat16",
         choices=tuple(DTYPE_MAP),
         metavar="{" + ",".join(DTYPE_MAP) + "}",
         help="Torch dtype to use when loading and running the model. Default: %(default)s",
     )
     args = parser.parse_args()
     torch_dtype = parse_torch_dtype(args.torch_dtype)
-    if args.partial_quant or args.target_module or args.target_projections or args.exclude_projections:
-        args.quant = True
 
-    if args.quant:
-        from quant.generate import Llama
-    else:
-        from src.generate import Llama
-
-    build_kwargs = {
-        "model_id": args.model_id,
-        "max_seq_len": args.max_seq_len,
-        "max_batch_size": 1,
-        "dtype": torch_dtype,
-    }
-    if args.quant:
-        build_kwargs["quant_block_size"] = args.quant_block_size
-        build_kwargs["partial_quant"] = args.partial_quant
-        build_kwargs["target_module"] = args.target_module
-        build_kwargs["target_projections"] = args.target_projections
-        build_kwargs["exclude_projections"] = args.exclude_projections
-        build_kwargs["calib_seq_len"] = args.calib_seq_len
-        build_kwargs["calib_samples"] = args.calib_samples
-        build_kwargs["calib_seed"] = args.calib_seed
-        build_kwargs["calib_max_tokens"] = args.calib_max_tokens
-
-    generator = Llama.build(**build_kwargs)
+    generator = Llama.build(
+        model_id=args.model_id,
+        max_seq_len=args.max_seq_len,
+        max_batch_size=1,
+        dtype=torch_dtype,
+    )
 
     tokenizer = generator.tokenizer
     dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split=args.split)
@@ -131,16 +111,9 @@ def main() -> None:
 
     print(f"dataset=wikitext2 split={args.split}")
     print(
-        f"seq_len={args.seq_len} seed={args.seed} num_samples={args.num_samples} "
-        f"torch_dtype={args.torch_dtype} quant={args.quant} partial_quant={args.partial_quant}"
+        f"model_id={args.model_id} seq_len={args.seq_len} seed={args.seed} num_samples={args.num_samples} "
+        f"torch_dtype={args.torch_dtype}"
     )
-    if args.quant:
-        print(
-            f"quant_block_size={args.quant_block_size} calib_seq_len={args.calib_seq_len} "
-            f"calib_samples={args.calib_samples} calib_max_tokens={args.calib_max_tokens} "
-            f"target_module={args.target_module} target_projections={args.target_projections} "
-            f"exclude_projections={args.exclude_projections}"
-        )
     print(f"avg_nll={avg_nll:.6f}")
     print(f"ppl={ppl:.6f}")
 

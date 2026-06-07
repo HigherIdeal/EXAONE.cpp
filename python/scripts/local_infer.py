@@ -3,10 +3,14 @@
 import argparse
 import sys
 import time
+from pathlib import Path
+
+PYTHON_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PYTHON_DIR))
 
 import torch
 
-from src.generate import MODEL_ID
+from src.generate import Llama, MODEL_ID, sample_top_p
 
 
 def visible_text(text: str) -> str:
@@ -100,7 +104,11 @@ def stream_generate_text(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-id", default=MODEL_ID)
+    parser.add_argument(
+        "--model-id",
+        default=MODEL_ID,
+        help=f"Local model directory or Hugging Face model ID. Default: {MODEL_ID}",
+    )
     parser.add_argument("--prompt", default="자기소개해봐.")
     parser.add_argument("--max-seq-len", type=int, default=2048)
     parser.add_argument("--max-new-tokens", type=int, default=1024)
@@ -108,16 +116,6 @@ def main() -> None:
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--reasoning", action="store_true")
     parser.add_argument("--show-tokens", action="store_true")
-    parser.add_argument("--quant", action="store_true", help="Use the quantized model path under python/quant.")
-    parser.add_argument("--partial_quant", "--partial-quant", action="store_true", help="Quantize only transformer layer 0.")
-    parser.add_argument("--quant-block-size", type=int, default=128)
-    parser.add_argument("--target-module", default=None, help="Quantize one exact module, e.g. layers.0.attention.wq.")
-    parser.add_argument("--target-projections", default=None, help="Comma-separated projection names, e.g. wq,wk,wv,wo.")
-    parser.add_argument("--exclude-projections", default=None, help="Comma-separated projection names to skip, e.g. wd.")
-    parser.add_argument("--calib-seq-len", type=int, default=2048)
-    parser.add_argument("--calib-samples", type=int, default=8)
-    parser.add_argument("--calib-seed", type=int, default=99)
-    parser.add_argument("--calib-max-tokens", type=int, default=4096)
     parser.add_argument(
         "--torch-dtype",
         type=parse_torch_dtype,
@@ -128,32 +126,12 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.partial_quant or args.target_module or args.target_projections or args.exclude_projections:
-        args.quant = True
-
-    if args.quant:
-        from quant.generate import Llama, sample_top_p
-    else:
-        from src.generate import Llama, sample_top_p
-
-    build_kwargs = {
-        "model_id": args.model_id,
-        "max_seq_len": args.max_seq_len,
-        "max_batch_size": 1,
-        "dtype": args.torch_dtype,
-    }
-    if args.quant:
-        build_kwargs["quant_block_size"] = args.quant_block_size
-        build_kwargs["partial_quant"] = args.partial_quant
-        build_kwargs["target_module"] = args.target_module
-        build_kwargs["target_projections"] = args.target_projections
-        build_kwargs["exclude_projections"] = args.exclude_projections
-        build_kwargs["calib_seq_len"] = args.calib_seq_len
-        build_kwargs["calib_samples"] = args.calib_samples
-        build_kwargs["calib_seed"] = args.calib_seed
-        build_kwargs["calib_max_tokens"] = args.calib_max_tokens
-
-    generator = Llama.build(**build_kwargs)
+    generator = Llama.build(
+        model_id=args.model_id,
+        max_seq_len=args.max_seq_len,
+        max_batch_size=1,
+        dtype=args.torch_dtype,
+    )
 
     tokenizer = generator.tokenizer
     inputs = tokenizer.apply_chat_template(

@@ -4,6 +4,7 @@ import io
 import json
 import locale
 import os
+import struct
 from contextlib import contextmanager
 from typing import List, Optional, Tuple
 
@@ -21,8 +22,11 @@ except ImportError:
 
 HF_MODEL_ID = "LGAI-EXAONE/EXAONE-4.0-1.2B"
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-MODEL_ID = os.path.join(REPO_ROOT, "weight", "exaone4-1.2b")
+MODEL_ID = os.path.join(REPO_ROOT, "weight", "EXAONE-4.0-1.2B")
 MODEL_PTH = "model.pth"
+MODEL_BIN = "model.bin"
+BIN_COUNT_STRUCT = struct.Struct("<I")
+BIN_ENTRY_STRUCT = struct.Struct("<IQ")
 
 
 @contextmanager
@@ -106,13 +110,29 @@ def convert_hf_state_dict(state_dict: dict[str, torch.Tensor], n_layers: int) ->
     return checkpoint
 
 
-def is_converted_model_dir(model_id: str) -> bool:
-    return os.path.isdir(model_id) and os.path.exists(os.path.join(model_id, MODEL_PTH))
+def is_local_model_dir(model_id: str) -> bool:
+    if not os.path.isdir(model_id):
+        return False
+    return any(
+        os.path.exists(os.path.join(model_id, filename))
+        for filename in (MODEL_BIN, MODEL_PTH)
+    )
 
 
 def resolve_runtime_model_id(model_id: str) -> str:
-    if is_converted_model_dir(model_id):
+    if os.path.isfile(model_id) and os.path.basename(model_id) in {
+        MODEL_BIN,
+        MODEL_PTH,
+    }:
+        return os.path.dirname(os.path.abspath(model_id))
+
+    if is_local_model_dir(model_id):
         return model_id
+
+    local_model_dir = os.path.join(REPO_ROOT, "weight", model_id)
+    if is_local_model_dir(local_model_dir):
+        return local_model_dir
+
     if os.path.abspath(model_id) == os.path.abspath(MODEL_ID):
         return HF_MODEL_ID
     return model_id
@@ -160,10 +180,193 @@ def load_converted_state_dict(model_id: str) -> dict[str, torch.Tensor]:
         return torch.load(checkpoint_path, map_location="cpu")
 
 
-def load_model_state_dict(model_id: str, n_layers: int) -> dict[str, torch.Tensor]:
-    if is_converted_model_dir(model_id):
+def bin_weight_specs(args: ModelArgs) -> list[tuple[str, str, bool, tuple[int, ...]]]:
+    head_dim = args.dim // args.n_heads
+    kv_dim = args.n_kv_heads * head_dim
+    specs = [
+        ("tok_embeddings.weight", "fp8", False, (args.vocab_size, args.dim))
+    ]
+
+    for layer in range(args.n_layers):
+        prefix = f"layers.{layer}"
+        specs.extend(
+            [
+                (f"{prefix}.attention.wq", "fp8", True, (args.dim, args.dim)),
+                (
+                    f"{prefix}.attention.q_norm.weight",
+                    "bf16",
+                    False,
+                    (head_dim,),
+                ),
+                (f"{prefix}.attention.wk", "fp8", True, (kv_dim, args.dim)),
+                (
+                    f"{prefix}.attention.k_norm.weight",
+                    "bf16",
+                    False,
+                    (head_dim,),
+                ),
+                (f"{prefix}.attention.wv", "fp8", True, (kv_dim, args.dim)),
+                (f"{prefix}.attention.wo", "fp8", True, (args.dim, args.dim)),
+                (
+                    f"{prefix}.attention_norm.weight",
+                    "bf16",
+                    False,
+                    (args.dim,),
+                ),
+                (
+                    f"{prefix}.feed_forward.wu",
+                    "fp8",
+                    True,
+                    (args.hidden_dim, args.dim),
+                ),
+                (
+                    f"{prefix}.feed_forward.wg",
+                    "fp8",
+                    True,
+                    (args.hidden_dim, args.dim),
+                ),
+                (
+                    f"{prefix}.feed_forward.wd",
+                    "fp8",
+                    True,
+                    (args.dim, args.hidden_dim),
+                ),
+                (
+                    f"{prefix}.ffn_norm.weight",
+                    "bf16",
+                    False,
+                    (args.dim,),
+                ),
+            ]
+        )
+
+    specs.append(("norm.weight", "bf16", False, (args.dim,)))
+    return specs
+
+
+def decode_fp8_payload(payload: bytes, shape: tuple[int, ...]) -> torch.Tensor:
+    packed = torch.frombuffer(bytearray(payload), dtype=torch.uint8).to(torch.int32)
+    bf16_bits = (
+        ((packed & 0x80) << 8)
+        | ((0x70 | ((packed >> 3) & 0x0F)) << 7)
+        | ((packed & 0x07) << 4)
+    )
+    return bf16_bits.to(torch.int16).view(torch.bfloat16).reshape(shape)
+
+
+def decode_bf16_payload(payload: bytes, shape: tuple[int, ...]) -> torch.Tensor:
+    if struct.pack("=H", 1) != struct.pack("<H", 1):
+        raise RuntimeError("model.bin BF16 decoding requires a little-endian host")
+    return (
+        torch.frombuffer(bytearray(payload), dtype=torch.uint8)
+        .view(torch.bfloat16)
+        .reshape(shape)
+        .clone()
+    )
+
+
+def load_binary_state_dict(
+    model_id: str,
+    args: ModelArgs,
+) -> dict[str, torch.Tensor]:
+    path = os.path.join(model_id, MODEL_BIN)
+    specs = bin_weight_specs(args)
+    file_size = os.path.getsize(path)
+
+    with open(path, "rb") as handle:
+        count_data = handle.read(BIN_COUNT_STRUCT.size)
+        if len(count_data) != BIN_COUNT_STRUCT.size:
+            raise ValueError(f"Invalid model.bin header: {path}")
+        weight_count = BIN_COUNT_STRUCT.unpack(count_data)[0]
+        if weight_count != len(specs):
+            raise ValueError(
+                f"model.bin weight count mismatch: "
+                f"file={weight_count}, expected={len(specs)}"
+            )
+
+        offsets = []
+        for expected_index in range(weight_count):
+            entry = handle.read(BIN_ENTRY_STRUCT.size)
+            if len(entry) != BIN_ENTRY_STRUCT.size:
+                raise ValueError(f"Truncated model.bin index: {path}")
+            index, offset = BIN_ENTRY_STRUCT.unpack(entry)
+            if index != expected_index:
+                raise ValueError(
+                    f"model.bin index mismatch: file={index}, "
+                    f"expected={expected_index}"
+                )
+            if offset % 64 != 0:
+                raise ValueError(
+                    f"model.bin weight {index} is not 64-byte aligned: {offset}"
+                )
+            offsets.append(offset)
+
+        checkpoint = {}
+        for index, (name, storage, transpose, source_shape) in enumerate(specs):
+            stored_shape = (
+                (source_shape[1], source_shape[0])
+                if transpose
+                else source_shape
+            )
+            elements = 1
+            for size in stored_shape:
+                elements *= size
+            payload_size = elements * (1 if storage == "fp8" else 2)
+            offset = offsets[index]
+            next_offset = offsets[index + 1] if index + 1 < weight_count else file_size
+            if offset + payload_size > next_offset:
+                raise ValueError(
+                    f"model.bin payload overlaps next weight: {name}"
+                )
+
+            handle.seek(offset)
+            payload = handle.read(payload_size)
+            if len(payload) != payload_size:
+                raise ValueError(f"Truncated model.bin payload: {name}")
+
+            if storage == "fp8":
+                tensor = decode_fp8_payload(payload, stored_shape)
+            else:
+                tensor = decode_bf16_payload(payload, stored_shape)
+            checkpoint[name] = tensor.t().contiguous() if transpose else tensor
+
+    return checkpoint
+
+
+def select_local_weight_format(model_id: str, weight_format: str) -> str:
+    available = {
+        "bin": os.path.exists(os.path.join(model_id, MODEL_BIN)),
+        "pth": os.path.exists(os.path.join(model_id, MODEL_PTH)),
+    }
+    if weight_format == "auto":
+        if available["bin"]:
+            return "bin"
+        if available["pth"]:
+            return "pth"
+    elif available.get(weight_format, False):
+        return weight_format
+
+    raise FileNotFoundError(
+        f"No usable local weights in {model_id}: "
+        f"requested={weight_format}, bin={available['bin']}, pth={available['pth']}"
+    )
+
+
+def load_model_state_dict(
+    model_id: str,
+    args: ModelArgs,
+    weight_format: str,
+) -> dict[str, torch.Tensor]:
+    if is_local_model_dir(model_id):
+        selected = select_local_weight_format(model_id, weight_format)
+        print(f"Weight source: {os.path.join(model_id, 'model.' + selected)}")
+        if selected == "bin":
+            return load_binary_state_dict(model_id, args)
         return load_converted_state_dict(model_id)
-    return convert_hf_state_dict(load_hf_state_dict(model_id), n_layers)
+    return convert_hf_state_dict(
+        load_hf_state_dict(model_id),
+        args.n_layers,
+    )
 
 
 class Llama:
@@ -174,10 +377,15 @@ class Llama:
         max_batch_size: int = 1,
         dtype: Optional[torch.dtype] = None,
         device: Optional[str | torch.device] = None,
+        weight_format: str = "auto",
     ) -> "Llama":
         start_time = time.time()
         device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         dtype = dtype or (torch.bfloat16 if device.type == "cuda" else torch.float32)
+        if weight_format not in {"auto", "bin", "pth"}:
+            raise ValueError(
+                "weight_format must be one of: auto, bin, pth"
+            )
         model_id = resolve_runtime_model_id(model_id)
 
         with force_utf8_locale(), force_utf8_chat_template_open():
@@ -201,7 +409,7 @@ class Llama:
         )
 
         model = Transformer(model_args).to(device=device, dtype=dtype)
-        checkpoint = load_model_state_dict(model_id, model_args.n_layers)
+        checkpoint = load_model_state_dict(model_id, model_args, weight_format)
         missing, unexpected = model.load_state_dict(checkpoint, strict=False)
         if missing or unexpected:
             raise RuntimeError(f"checkpoint mismatch: missing={missing}, unexpected={unexpected}")
