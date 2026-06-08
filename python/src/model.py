@@ -132,6 +132,18 @@ class Attention(nn.Module):
         xk = linear(x, self.wk)
         xv = linear(x, self.wv)
 
+
+        
+                        
+        # jw debug import
+        torch.set_printoptions(precision=8, sci_mode=True)
+        temp = self.wq.t().flatten()
+        print(f'temp: {temp[0:4]}')
+        sys.exit()  
+        
+        # jw debug end
+        
+
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
@@ -225,15 +237,6 @@ class Transformer(nn.Module):
         
         h = self.tok_embeddings(tokens)
 
-                        
-        # # jw debug import
-        
-        # temp = self.tok_embeddings.weight
-        # print(f'temp: {temp}')
-        # sys.exit()  
-        
-        # # jw debug end
-        
         freqs_cos = self.freqs_cos[start_pos : start_pos + seqlen].to(h.device, dtype=h.dtype)
         freqs_sin = self.freqs_sin[start_pos : start_pos + seqlen].to(h.device, dtype=h.dtype)
 

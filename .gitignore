@@ -13,3 +13,17 @@ cmake_install.cmake
 
 CppProperties.json
 CMakeUserPresets.json
+
+.vs/
+x64/
+x86/
+Debug/
+Release/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.log
+*.tlog
+*.lastbuildstate
+*.vcxproj.user

@@ -84,12 +84,12 @@ void EXAONE::generate()
 {
 	std::cout << std::scientific << std::setprecision(8);
 	std::cout << "embedding weight num:" << header[0] << "\n";
-	int offset = header[0]; // FP8 E4M3
+	int offset = header[1]; // FP8 E4M3
 	for (int i = 0; i < 4; ++i) {
-		uint32_t significand = (weight[offset + i] & 0x07) << 14;
-		uint32_t exponent = (weight[offset + i] & 0x78) << 14 | 0x38000000;
-		uint32_t sign = (weight[offset + i] & 0x80) << 18;
-		uint32_t float_bits = sign | exponent | significand;
+		uint8_t x = weight[offset + i];
+		uint32_t sign = static_cast<uint32_t>(x & 0x80) << 24;
+		uint32_t body = static_cast<uint32_t>(x & 0x7F) << 20;
+		uint32_t float_bits = sign | 0x38000000u | body;
 		float value = *reinterpret_cast<float*>(&float_bits);
 		std::cout << value << ", ";
 	}
