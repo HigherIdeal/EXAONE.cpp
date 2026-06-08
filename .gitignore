@@ -14,6 +14,7 @@ cmake_install.cmake
 CppProperties.json
 CMakeUserPresets.json
 
+out/
 .vs/
 x64/
 x86/
