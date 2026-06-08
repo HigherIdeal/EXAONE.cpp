@@ -35,4 +35,9 @@ private:
 	void loadWeights(const std::string& path);
     void prefill();
     void decoding();
+
+	uint16_t unpack(const uint8_t);
+	//float unpack(const uint8_t);
+	//float unpack(const uint16_t);
+
 };
