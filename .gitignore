@@ -6,3 +6,10 @@ weight/EXAONE*/
 cpp/build/
 cpp/.vs
 weight/test.py
+
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+CppProperties.json
+CMakeUserPresets.json

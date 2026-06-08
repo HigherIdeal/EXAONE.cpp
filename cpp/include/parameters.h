@@ -1,6 +1,7 @@
 #pragma once
 #include <iostream>
 #include <cstdint>
+#include <iomanip>
 
 #define VOCAB_SIZE 102400
 #define MAX_SEQ_LEN 16384

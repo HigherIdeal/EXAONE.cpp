@@ -16,49 +16,49 @@
 
 namespace {
 
-	void readExact(std::ifstream& file, char* dst, std::streamsize size, const char* what)
-	{
-		file.read(dst, size);
-		if (file.gcount() != size) {
-			throw std::runtime_error(std::string("failed to read ") + what);
-		}
+void readExact(std::ifstream& file, char* dst, std::streamsize size, const char* what)
+{
+	file.read(dst, size);
+	if (file.gcount() != size) {
+		throw std::runtime_error(std::string("failed to read ") + what);
+	}
+}
+
+uint32_t readU32LE(std::ifstream& file, const char* what)
+{
+	unsigned char bytes[4];
+	readExact(file, reinterpret_cast<char*>(bytes), 4, what);
+
+	return static_cast<uint32_t>(bytes[0])
+		| (static_cast<uint32_t>(bytes[1]) << 8)
+		| (static_cast<uint32_t>(bytes[2]) << 16)
+		| (static_cast<uint32_t>(bytes[3]) << 24);
+}
+
+uint64_t readU64LE(std::ifstream& file, const char* what)
+{
+	unsigned char bytes[8];
+	readExact(file, reinterpret_cast<char*>(bytes), 8, what);
+
+	uint64_t value = 0;
+	for (int i = 0; i < 8; ++i) {
+		value |= static_cast<uint64_t>(bytes[i]) << (8 * i);
+	}
+	return value;
+}
+
+uint64_t getFileSize(std::ifstream& file)
+{
+	file.seekg(0, std::ios::end);
+
+	const std::streamoff size = file.tellg();
+	if (size <= 0) {
+		throw std::runtime_error("invalid model.bin size");
 	}
 
-	uint32_t readU32LE(std::ifstream& file, const char* what)
-	{
-		unsigned char bytes[4];
-		readExact(file, reinterpret_cast<char*>(bytes), 4, what);
-
-		return static_cast<uint32_t>(bytes[0])
-			| (static_cast<uint32_t>(bytes[1]) << 8)
-			| (static_cast<uint32_t>(bytes[2]) << 16)
-			| (static_cast<uint32_t>(bytes[3]) << 24);
-	}
-
-	uint64_t readU64LE(std::ifstream& file, const char* what)
-	{
-		unsigned char bytes[8];
-		readExact(file, reinterpret_cast<char*>(bytes), 8, what);
-
-		uint64_t value = 0;
-		for (int i = 0; i < 8; ++i) {
-			value |= static_cast<uint64_t>(bytes[i]) << (8 * i);
-		}
-		return value;
-	}
-
-	uint64_t getFileSize(std::ifstream& file)
-	{
-		file.seekg(0, std::ios::end);
-
-		const std::streamoff size = file.tellg();
-		if (size <= 0) {
-			throw std::runtime_error("invalid model.bin size");
-		}
-
-		file.seekg(0, std::ios::beg);
-		return static_cast<uint64_t>(size);
-	}
+	file.seekg(0, std::ios::beg);
+	return static_cast<uint64_t>(size);
+}
 
 } // namespace
 
@@ -78,6 +78,22 @@ EXAONE::~EXAONE()
 
 	weight = nullptr;
 	weight_bytes = 0;
+}
+
+void EXAONE::generate()
+{
+	std::cout << std::scientific << std::setprecision(8);
+	std::cout << "embedding weight num:" << header[0] << "\n";
+	int offset = header[0]; // FP8 E4M3
+	for (int i = 0; i < 4; ++i) {
+		uint32_t significand = (weight[offset + i] & 0x07) << 14;
+		uint32_t exponent = (weight[offset + i] & 0x78) << 14 | 0x38000000;
+		uint32_t sign = (weight[offset + i] & 0x80) << 18;
+		uint32_t float_bits = sign | exponent | significand;
+		float value = *reinterpret_cast<float*>(&float_bits);
+		std::cout << value << ", ";
+	}
+	std::cout << "\n";
 }
 
 void EXAONE::loadWeights(const std::string& path)
